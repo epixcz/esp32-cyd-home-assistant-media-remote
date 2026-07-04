@@ -281,7 +281,7 @@ void loop()
 
 #define CONFIG_FILE "/ha_media_config.json"
 #define AP_NAME "CYD-HA-Media"
-#define AP_PASSWORD "thing123"
+#define AP_PASSWORD "cydmedia"
 
 #if defined(PANEL_ESP32_3248S035C)
 #define SCREEN_W 480
@@ -1085,6 +1085,51 @@ void applyMediaState(JsonVariantConst root)
   }
 }
 
+struct JpegStreamCtx {
+  WiFiClient *stream;
+  HTTPClient *http;
+  int remaining;
+};
+
+int coverDrawX = 0;
+int coverDrawY = 0;
+
+// tjpgd input callback: read (or skip, when buf is null) bytes from the
+// HTTP stream, blocking briefly until they arrive.
+size_t jpgStreamIn(JDEC *jd, uint8_t *buf, size_t len)
+{
+  JpegStreamCtx *ctx = (JpegStreamCtx *)jd->device;
+  if ((int)len > ctx->remaining) {
+    len = ctx->remaining;
+  }
+  size_t done = 0;
+  uint8_t skipBuf[64];
+  unsigned long deadline = millis() + 3000;
+  while (done < len && millis() < deadline) {
+    uint8_t *dst = buf ? buf + done : skipBuf;
+    size_t want = buf ? len - done : min(sizeof(skipBuf), len - done);
+    int count = ctx->stream->read(dst, want);
+    if (count > 0) {
+      done += count;
+      deadline = millis() + 3000;
+    } else if (!ctx->http->connected() && !ctx->stream->available()) {
+      break;
+    } else {
+      delay(1);
+    }
+  }
+  ctx->remaining -= done;
+  return done;
+}
+
+int jpgStreamOut(JDEC *jd, void *bitmap, JRECT *rect)
+{
+  int w = rect->right - rect->left + 1;
+  int h = rect->bottom - rect->top + 1;
+  tft.pushImage(coverDrawX + rect->left, coverDrawY + rect->top, w, h, (uint16_t *)bitmap);
+  return 1;
+}
+
 bool downloadAndDrawImage(const String &picture)
 {
   if (picture.length() == 0) {
@@ -1108,88 +1153,40 @@ bool downloadAndDrawImage(const String &picture)
     return false;
   }
 
-  LittleFS.remove(COVER_FILE);
-  File file = LittleFS.open(COVER_FILE, "w");
-  if (!file) {
-    Serial.printf("Failed to open cover file for writing: errno=%d (%s), fs used=%u/%u heap=%u\n",
-      errno, strerror(errno), (unsigned)LittleFS.usedBytes(), (unsigned)LittleFS.totalBytes(),
-      (unsigned)ESP.getFreeHeap());
+  // Decode straight from the HTTP stream with the low-level tjpgd API —
+  // needs only a ~4 kB workspace, so cover size doesn't matter.
+  JpegStreamCtx ctx;
+  ctx.stream = http.getStreamPtr();
+  ctx.http = &http;
+  ctx.remaining = http.getSize() > 0 ? http.getSize() : 0x7FFFFFFF;
+
+  static uint8_t jdWorkspace[3904];
+  JDEC jdec;
+  JRESULT result = jd_prepare(&jdec, jpgStreamIn, jdWorkspace, sizeof(jdWorkspace), &ctx);
+  if (result != JDR_OK) {
+    Serial.printf("Cover JPEG prepare failed: %d\n", (int)result);
     http.end();
     return false;
   }
+  // Bodmer's tjpgd fork swaps RGB565 bytes inside the decoder; jd_prepare
+  // leaves the field uninitialized, so set it explicitly.
+  jdec.swap = true;
 
-  WiFiClient *stream = http.getStreamPtr();
-  int contentLength = http.getSize();
-  int remaining = contentLength;
-  int totalRead = 0;
-  uint8_t buffer[1024];
-  unsigned long deadline = millis() + 6000;
-
-  while ((http.connected() || stream->available()) && millis() < deadline) {
-    size_t available = stream->available();
-    if (available) {
-      int toRead = min((int)available, (int)sizeof(buffer));
-      int count = stream->readBytes(buffer, toRead);
-      if (count <= 0) {
-        break;
-      }
-      if (file.write(buffer, count) != (size_t)count) {
-        Serial.println("Cover write failed (filesystem full?)");
-        totalRead = 0;
-        break;
-      }
-      totalRead += count;
-      if (remaining > 0) {
-        remaining -= count;
-        if (remaining <= 0) {
-          break;
-        }
-      }
-      deadline = millis() + 1000;
-    } else {
-      delay(1);
-    }
+  uint8_t scale = 0;
+  while (scale < 3 && ((jdec.width >> scale) > COVER_SIZE || (jdec.height >> scale) > COVER_SIZE)) {
+    scale++;
   }
-  file.close();
-  http.end();
-
-  if (totalRead <= 0 || (contentLength > 0 && totalRead < contentLength)) {
-    Serial.printf("Cover download incomplete: read=%d expected=%d\n", totalRead, contentLength);
-    LittleFS.remove(COVER_FILE);
-    return false;
-  }
-
-  uint16_t jpgW = 0;
-  uint16_t jpgH = 0;
-  JRESULT sizeResult = TJpgDec.getFsJpgSize(&jpgW, &jpgH, COVER_FILE, LittleFS);
-  Serial.printf("Cover: read=%d expected=%d size=%ux%u sizeResult=%d\n",
-    totalRead, contentLength, jpgW, jpgH, (int)sizeResult);
-  if (sizeResult != JDR_OK) {
-    Serial.println("Cover JPEG size read failed");
-    LittleFS.remove(COVER_FILE);
-    return false;
-  }
-
-  uint8_t scale = 8;
-  if (jpgW <= COVER_SIZE && jpgH <= COVER_SIZE) {
-    scale = 1;
-  } else if ((jpgW / 2) <= COVER_SIZE && (jpgH / 2) <= COVER_SIZE) {
-    scale = 2;
-  } else if ((jpgW / 4) <= COVER_SIZE && (jpgH / 4) <= COVER_SIZE) {
-    scale = 4;
-  }
-
-  int drawW = jpgW / scale;
-  int drawH = jpgH / scale;
-  int drawX = COVER_X + max(0, (COVER_SIZE - drawW) / 2);
-  int drawY = COVER_Y + max(0, (COVER_SIZE - drawH) / 2);
+  int drawW = jdec.width >> scale;
+  int drawH = jdec.height >> scale;
+  coverDrawX = COVER_X + max(0, (COVER_SIZE - drawW) / 2);
+  coverDrawY = COVER_Y + max(0, (COVER_SIZE - drawH) / 2);
 
   tft.fillRect(COVER_X, COVER_Y, COVER_SIZE, COVER_SIZE, TFT_BLACK);
-  TJpgDec.setJpgScale(scale);
-  JRESULT drawResult = TJpgDec.drawFsJpg(drawX, drawY, COVER_FILE, LittleFS);
-  if (drawResult != JDR_OK) {
-    Serial.printf("Cover JPEG draw failed: %d (scale=%u draw=%dx%d at %d,%d)\n",
-      (int)drawResult, scale, drawW, drawH, drawX, drawY);
+  result = jd_decomp(&jdec, jpgStreamOut, scale);
+  http.end();
+
+  Serial.printf("Cover: %ux%u scale=1/%d result=%d\n", jdec.width, jdec.height, 1 << scale, (int)result);
+  if (result != JDR_OK) {
     return false;
   }
   imageDisplayed = true;
@@ -1213,12 +1210,24 @@ void refreshDisplayAfterState()
   drawProgress(currentMedia.progressMs, currentMedia.durationMs);
 
   if (currentMedia.picture != lastPicture) {
+    static String failedPicture;
+    static int failCount = 0;
+    if (currentMedia.picture != failedPicture) {
+      failCount = 0;
+    }
+    if (failCount >= 3) {
+      return; // give up on this picture, keep whatever is on screen
+    }
     lastPicture = currentMedia.picture;
     if (!downloadAndDrawImage(currentMedia.picture)) {
       tft.fillRect(COVER_X, COVER_Y, COVER_SIZE, COVER_SIZE, TFT_BLACK);
       tft.drawRect(COVER_X - 1, COVER_Y - 1, COVER_SIZE + 2, COVER_SIZE + 2, TFT_DARKGREY);
       imageDisplayed = false;
-      lastPicture = ""; // retry on the next poll
+      failedPicture = currentMedia.picture;
+      failCount++;
+      lastPicture = ""; // retry on the next poll (up to 3 attempts)
+    } else {
+      failCount = 0;
     }
   }
 }
