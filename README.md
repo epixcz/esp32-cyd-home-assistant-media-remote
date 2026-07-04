@@ -2,7 +2,9 @@
 
 An ESP32 touch-screen remote for a Home Assistant `media_player` entity (Spotify, Sonos, anything with media attributes). Shows the current track with cover art and lets you control playback right from the display.
 
-![Playing screen: cover art, title/artist/album, progress bar, prev / play-pause / next / volume controls]
+| ESP32-2432S028R (2.8") | ESP32-3248S035C (3.5") |
+|---|---|
+| ![2.8" CYD showing the now-playing screen](docs/esp32-2432s028r.jpg) | ![3.5" board showing the now-playing screen](docs/esp32-3248s035c.jpg) |
 
 ## Features
 
@@ -18,10 +20,10 @@ An ESP32 touch-screen remote for a Home Assistant `media_player` entity (Spotify
 
 ## Supported boards
 
-| Board | Display | Touch | PlatformIO env |
-|---|---|---|---|
-| CYD ESP32-2432S028R (2.8", 320×240) | ILI9341 | XPT2046 (resistive) | `cyd` (or `cyd2usb` for the USB-C variant with inverted colors) |
-| ESP32-3248S035C (3.5", 480×320) | ST7796 | GT911 (capacitive) | `esp32_3248s035c` |
+| Board | Display | Touch | PlatformIO env | Where to buy |
+|---|---|---|---|---|
+| **ESP32-2432S028R** — "Cheap Yellow Display" (2.8", 320×240) | ILI9341 | XPT2046 (resistive) | `cyd` (or `cyd2usb` for the USB-C variant with inverted colors) | [AliExpress](https://www.aliexpress.com/item/1005007774435209.html) |
+| **ESP32-3248S035C** (3.5", 480×320) | ST7796 | GT911 (capacitive) | `esp32_3248s035c` | [AliExpress](https://www.aliexpress.com/item/1005008624700714.html) |
 
 Not sure which 2.8" variant you have? Flash `cyd` first; if colors look inverted (white background instead of black), use `cyd2usb`.
 
