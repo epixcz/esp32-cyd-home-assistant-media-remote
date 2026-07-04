@@ -1499,7 +1499,11 @@ void setup()
   // UTC only — parseIso8601Ms relies on mktime() treating struct tm as UTC.
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
 
-  ArduinoOTA.setHostname("cyd-ha-media");
+  // unique per device so two boards on one network don't collide in mDNS
+  char otaHostname[32];
+  snprintf(otaHostname, sizeof(otaHostname), "cyd-ha-media-%04x",
+    (unsigned)(ESP.getEfuseMac() & 0xFFFF));
+  ArduinoOTA.setHostname(otaHostname);
   ArduinoOTA.setPassword(AP_PASSWORD);
   ArduinoOTA.onStart([]() {
     drawCenteredMessage("OTA update", "Uploading...");
