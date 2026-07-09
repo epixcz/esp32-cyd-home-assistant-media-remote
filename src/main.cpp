@@ -15,6 +15,8 @@
 #include <time.h>
 #include <sys/time.h>
 
+#include <MediaRemoteCore.h>
+
 #if defined(PANEL_CYD_2432S028R)
 #include "CYD28_TouchscreenR.h"
 #endif
@@ -513,9 +515,8 @@ void addHaHeaders(HTTPClient &http)
 // (entity_picture can point at an external CDN).
 bool isHaHostUrl(const String &url)
 {
-  return !url.startsWith("http://") && !url.startsWith("https://")
-    ? true
-    : url.startsWith(haBaseUrl() + "/") || url == haBaseUrl();
+  String absoluteUrl = makeHaUrl(url);
+  return media_remote::sameOrigin(haBaseUrl().c_str(), absoluteUrl.c_str());
 }
 
 // Parses HA ISO 8601 timestamps like "2026-07-04T12:34:56.789012+00:00"
@@ -800,7 +801,7 @@ void drawProgress(long progressMs, long durationMs)
   if (progressMs > durationMs) {
     progressMs = durationMs;
   }
-  int fillW = map(progressMs, 0, durationMs, 0, BAR_W);
+  int fillW = media_remote::progressBarWidth(progressMs, durationMs, BAR_W);
   tft.drawFastHLine(BAR_X, BAR_Y, BAR_W, TFT_DARKGREY);
   tft.drawFastHLine(BAR_X, BAR_Y + 1, BAR_W, TFT_DARKGREY);
   tft.drawFastHLine(BAR_X, BAR_Y, fillW, TFT_WHITE);
@@ -1104,14 +1105,14 @@ size_t jpgStreamIn(JDEC *jd, uint8_t *buf, size_t len)
   }
   size_t done = 0;
   uint8_t skipBuf[64];
-  unsigned long deadline = millis() + 3000;
-  while (done < len && millis() < deadline) {
+  unsigned long lastByteAt = millis();
+  while (done < len && media_remote::elapsedMs(millis(), lastByteAt) < 3000) {
     uint8_t *dst = buf ? buf + done : skipBuf;
     size_t want = buf ? len - done : min(sizeof(skipBuf), len - done);
     int count = ctx->stream->read(dst, want);
     if (count > 0) {
       done += count;
-      deadline = millis() + 3000;
+      lastByteAt = millis();
     } else if (!ctx->http->connected() && !ctx->stream->available()) {
       break;
     } else {
@@ -1356,7 +1357,8 @@ void setupWebSocket()
 
 void updateEstimatedProgress()
 {
-  if (!currentMedia.playing || playbackStartedAt == 0 || millis() < nextProgressAt) {
+  if (!currentMedia.playing || playbackStartedAt == 0
+      || !media_remote::deadlineReached(millis(), nextProgressAt)) {
     return;
   }
   long progress = millis() - playbackStartedAt;
@@ -1563,7 +1565,7 @@ void loop()
 
   ws.loop();
 
-  if (millis() >= nextPollAt) {
+  if (media_remote::deadlineReached(millis(), nextPollAt)) {
     nextPollAt = millis() + (wsActive() ? wsPollIntervalMs : pollIntervalMs);
     if (fetchMediaState() && !showVolumeModal) {
       refreshDisplayAfterState();

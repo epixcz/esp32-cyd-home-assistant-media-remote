@@ -123,13 +123,15 @@ pio device monitor             # serial console, 115200 baud
 Before committing, run the same complete build matrix as CI:
 
 ```sh
+pio test -c platformio.test.ini -e native
 pio run -e cyd -e cyd2usb -e diag -e esp32_3248s035c -e diag_esp32_3248s035c -e touchdiag_esp32_3248s035c
 ```
 
-The six environments cover both production board variants and all diagnostic
-firmwares. Dependency updates should be made separately from feature changes,
-then verified with the full build matrix and a smoke test on both physical
-boards.
+The native suite covers overflow-safe progress, timer rollover and URL-origin
+policy without hardware. The six firmware environments cover both production
+board variants and all diagnostic firmwares. Dependency updates should be made
+separately from feature changes, then verified with the native suite, full
+build matrix and a smoke test on both physical boards.
 
 Everything lives in `src/main.cpp`; the board-specific layout constants are at the top of the main firmware section, guarded by `PANEL_*` defines. Diagnostic firmwares are selected with the `DIAGNOSTIC_TFT` / `DIAGNOSTIC_GT911` build flags (see `platformio.ini`).
 
@@ -145,3 +147,8 @@ Notes for contributors:
   platform and all external libraries to the versions verified by the audit;
   added a six-environment GitHub Actions build matrix and documented its exact
   local equivalent. Hardware behavior was not changed by this plan.
+- **Plan 002 — tested core policies:** introduced an Arduino-independent core
+  library and native Unity tests; progress width now uses 64-bit arithmetic,
+  timer deadlines survive the `millis()` rollover, and HA authorization checks
+  compare parsed URL origins instead of string prefixes. Hardware smoke testing
+  is still required for display timing and long-running operation.
