@@ -113,10 +113,23 @@ mode: single
 ## Development
 
 ```sh
+python3 -m pip install -r requirements-dev.txt
+
 pio run                        # build the default env (cyd)
 pio run -e esp32_3248s035c     # build for the 3.5" board
 pio device monitor             # serial console, 115200 baud
 ```
+
+Before committing, run the same complete build matrix as CI:
+
+```sh
+pio run -e cyd -e cyd2usb -e diag -e esp32_3248s035c -e diag_esp32_3248s035c -e touchdiag_esp32_3248s035c
+```
+
+The six environments cover both production board variants and all diagnostic
+firmwares. Dependency updates should be made separately from feature changes,
+then verified with the full build matrix and a smoke test on both physical
+boards.
 
 Everything lives in `src/main.cpp`; the board-specific layout constants are at the top of the main firmware section, guarded by `PANEL_*` defines. Diagnostic firmwares are selected with the `DIAGNOSTIC_TFT` / `DIAGNOSTIC_GT911` build flags (see `platformio.ini`).
 
@@ -125,3 +138,10 @@ Notes for contributors:
 - `lib_ldf_mode = deep` is required — the WebSockets library isn't found by `deep+`.
 - `board_build.partitions = min_spiffs.csv` gives the app 1.9 MB (needed) and keeps a small LittleFS for the config file. Changing the partition table wipes the stored configuration.
 - TFT_eSPI is configured entirely through build flags (`-DUSER_SETUP_LOADED`), no `User_Setup.h` editing needed.
+
+## Implementation log
+
+- **Plan 001 — reproducible build gate:** pinned PlatformIO Core, the ESP32
+  platform and all external libraries to the versions verified by the audit;
+  added a six-environment GitHub Actions build matrix and documented its exact
+  local equivalent. Hardware behavior was not changed by this plan.
