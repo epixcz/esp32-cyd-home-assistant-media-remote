@@ -62,10 +62,28 @@ Connect to it and the portal opens automatically (or visit `http://192.168.4.1`)
 | HA URL | `http://homeassistant.local:8123` |
 | HA token | the long-lived token from step 1 |
 | media_player entity | `media_player.spotify_your_name` |
+| HA TLS SHA-256 fingerprint | required only for an `https://` HA URL |
 
 The configuration is stored on the device (LittleFS). To reopen the portal later, hold the **BOOT** button while pressing reset.
 
-HTTPS URLs work too (certificate verification is disabled); plain HTTP on a trusted LAN is simpler and recommended.
+Plain HTTP is supported for a trusted LAN, but it does not protect the HA token
+from another device able to observe that network. HTTPS verifies both the HA
+hostname and a provisioned SHA-256 certificate fingerprint before sending any
+authenticated REST or WebSocket data.
+
+For an HTTPS endpoint, obtain the SHA-256 fingerprint from a trusted computer
+and paste either the 64 hexadecimal characters or the colon-separated form into
+the portal:
+
+```sh
+openssl s_client -connect homeassistant.example:443 -servername homeassistant.example </dev/null 2>/dev/null \
+  | openssl x509 -noout -fingerprint -sha256
+```
+
+Verify the value through a separate trusted channel before saving it. A renewed
+or replaced HA certificate has a new fingerprint; hold **BOOT** during reset to
+update it. A missing or mismatched fingerprint makes HTTPS fail closed before
+the bearer token is sent.
 
 ### 4. OTA updates (optional)
 
@@ -108,7 +126,7 @@ mode: single
 - It then opens a WebSocket to `/api/websocket`, authenticates with the token and sends `subscribe_trigger` with state triggers for the entity **and** its `media_title`, `media_position` and `volume_level` attributes (a plain state trigger ignores attribute-only changes — that's why the extra triggers are needed).
 - While the WebSocket is healthy, REST polling drops to a 60 s safety interval; on disconnect it falls back to 3 s until the socket reconnects.
 - State JSON is parsed with an ArduinoJson filter (Spotify entities carry a huge `source_list` that would otherwise blow the buffer).
-- Cover art (`entity_picture`) is fetched from HA and decoded with the low-level tjpgd API directly from the HTTP stream. The auth token is only ever sent to the configured HA host, never to external image CDNs.
+- Cover art (`entity_picture`) is fetched through an explicit redirect loop and decoded with the low-level tjpgd API directly from the HTTP stream. Every redirect hop gets a fresh HTTP client; the auth token is attached only when that hop has the exact configured HA scheme, host and port. HTTPS-to-HTTP downgrades and redirect loops are rejected.
 
 ## Development
 
@@ -152,3 +170,10 @@ Notes for contributors:
   timer deadlines survive the `millis()` rollover, and HA authorization checks
   compare parsed URL origins instead of string prefixes. Hardware smoke testing
   is still required for display timing and long-running operation.
+- **Plan 003 — verified HA transport:** HTTPS REST and WebSocket connections now
+  require the provisioned SHA-256 certificate fingerprint, validated before any
+  HA token is sent. Cover redirects are resolved explicitly with a fresh client
+  per hop, cross-origin hops drop authorization, downgrade/loop/limit cases are
+  rejected, and native policy tests cover fingerprint and redirect handling.
+  The audit plan mentioned SHA-1, but the pinned ESP32 framework actually
+  verifies SHA-256; the implementation follows the framework's stronger API.

@@ -343,6 +343,7 @@ struct AppConfig {
   char haUrl[96];
   char token[384];
   char entityId[80];
+  char tlsFingerprint[65];
 };
 
 struct MediaState {
@@ -493,12 +494,82 @@ String makeHaUrl(const String &path)
   return haBaseUrl() + "/" + path;
 }
 
+void drawStatusLine(const String &message, uint16_t color);
+
+// The HA bearer token must never be sent to third-party hosts.
+bool isHaHostUrl(const String &url)
+{
+  String absoluteUrl = makeHaUrl(url);
+  return media_remote::sameOrigin(haBaseUrl().c_str(), absoluteUrl.c_str());
+}
+
+bool normalizeAndValidateConfig()
+{
+  media_remote::Origin origin = media_remote::parseHttpOrigin(config.haUrl);
+  if (!origin.valid || !config.token[0] || !config.entityId[0]) {
+    return false;
+  }
+
+  if (origin.scheme == media_remote::UrlScheme::Https) {
+    char normalized[65];
+    if (!media_remote::normalizeSha256Fingerprint(config.tlsFingerprint, normalized, sizeof(normalized))) {
+      return false;
+    }
+    strlcpy(config.tlsFingerprint, normalized, sizeof(config.tlsFingerprint));
+  } else if (config.tlsFingerprint[0]) {
+    char normalized[65];
+    if (!media_remote::normalizeSha256Fingerprint(config.tlsFingerprint, normalized, sizeof(normalized))) {
+      return false;
+    }
+    strlcpy(config.tlsFingerprint, normalized, sizeof(config.tlsFingerprint));
+  }
+  return true;
+}
+
+bool beginVerifiedHaHttps(HTTPClient &http, const String &url, const media_remote::Origin &origin)
+{
+  if (!config.tlsFingerprint[0]) {
+    Serial.println("HA TLS fingerprint missing");
+    drawStatusLine("TLS fingerprint missing", TFT_RED);
+    return false;
+  }
+
+  secureClient.stop();
+  // The TLS handshake itself is permissive, but no HTTP bytes are sent until
+  // the configured SHA-256 pin and hostname have both been verified below.
+  secureClient.setInsecure();
+  if (!http.begin(secureClient, url)) {
+    return false;
+  }
+  if (!secureClient.connect(origin.host, origin.port, 2000)
+      || !secureClient.verify(config.tlsFingerprint, origin.host)) {
+    Serial.println("HA TLS verification failed");
+    drawStatusLine("HA TLS verify failed", TFT_RED);
+    secureClient.stop();
+    http.end();
+    return false;
+  }
+  return true;
+}
+
 bool beginHttp(HTTPClient &http, const String &url)
 {
   // Keep timeouts short: these requests run in loop() and block the UI.
   http.setConnectTimeout(2000);
   http.setTimeout(3000);
-  if (url.startsWith("https://")) {
+
+  media_remote::Origin origin = media_remote::parseHttpOrigin(url.c_str());
+  if (!origin.valid) {
+    Serial.println("Invalid HTTP URL");
+    return false;
+  }
+  if (origin.scheme == media_remote::UrlScheme::Https && isHaHostUrl(url)) {
+    return beginVerifiedHaHttps(http, url, origin);
+  }
+  if (origin.scheme == media_remote::UrlScheme::Https) {
+    // External cover hosts never receive the HA token. Their general-purpose
+    // PKI trust remains outside the HA credential boundary in this firmware.
+    secureClient.stop();
     secureClient.setInsecure();
     return http.begin(secureClient, url);
   }
@@ -509,14 +580,6 @@ void addHaHeaders(HTTPClient &http)
 {
   http.addHeader("Authorization", "Bearer " + String(config.token));
   http.addHeader("Content-Type", "application/json");
-}
-
-// The HA bearer token must never be sent to third-party hosts
-// (entity_picture can point at an external CDN).
-bool isHaHostUrl(const String &url)
-{
-  String absoluteUrl = makeHaUrl(url);
-  return media_remote::sameOrigin(haBaseUrl().c_str(), absoluteUrl.c_str());
 }
 
 // Parses HA ISO 8601 timestamps like "2026-07-04T12:34:56.789012+00:00"
@@ -849,7 +912,7 @@ bool loadConfig()
     return false;
   }
 
-  StaticJsonDocument<768> doc;
+  StaticJsonDocument<1024> doc;
   DeserializationError error = deserializeJson(doc, file);
   file.close();
   if (error) {
@@ -860,16 +923,18 @@ bool loadConfig()
   strlcpy(config.haUrl, doc["haUrl"] | "", sizeof(config.haUrl));
   strlcpy(config.token, doc["token"] | "", sizeof(config.token));
   strlcpy(config.entityId, doc["entityId"] | "", sizeof(config.entityId));
+  strlcpy(config.tlsFingerprint, doc["tlsFingerprint"] | "", sizeof(config.tlsFingerprint));
 
-  return config.haUrl[0] && config.token[0] && config.entityId[0];
+  return normalizeAndValidateConfig();
 }
 
 void saveConfig()
 {
-  StaticJsonDocument<768> doc;
+  StaticJsonDocument<1024> doc;
   doc["haUrl"] = config.haUrl;
   doc["token"] = config.token;
   doc["entityId"] = config.entityId;
+  doc["tlsFingerprint"] = config.tlsFingerprint;
 
   File file = LittleFS.open(CONFIG_FILE, "w");
   if (!file) {
@@ -891,13 +956,19 @@ void setupWiFiAndConfig(bool forceConfig)
   wm.setSaveConfigCallback(saveConfigCallback);
   wm.setAPCallback(drawWifiManagerMessage);
 
+  char tlsFingerprintInput[96];
+  strlcpy(tlsFingerprintInput, config.tlsFingerprint, sizeof(tlsFingerprintInput));
+
   WiFiManagerParameter haUrlParam("ha_url", "HA URL", config.haUrl, sizeof(config.haUrl));
   WiFiManagerParameter tokenParam("ha_token", "HA token", config.token, sizeof(config.token));
   WiFiManagerParameter entityParam("entity_id", "media_player entity", config.entityId, sizeof(config.entityId));
+  WiFiManagerParameter tlsFingerprintParam(
+    "ha_tls_fp", "HA TLS SHA-256 fingerprint", tlsFingerprintInput, sizeof(tlsFingerprintInput));
 
   wm.addParameter(&haUrlParam);
   wm.addParameter(&tokenParam);
   wm.addParameter(&entityParam);
+  wm.addParameter(&tlsFingerprintParam);
 
   bool connected = forceConfig
     ? wm.startConfigPortal(AP_NAME, AP_PASSWORD)
@@ -910,6 +981,20 @@ void setupWiFiAndConfig(bool forceConfig)
   strlcpy(config.haUrl, haUrlParam.getValue(), sizeof(config.haUrl));
   strlcpy(config.token, tokenParam.getValue(), sizeof(config.token));
   strlcpy(config.entityId, entityParam.getValue(), sizeof(config.entityId));
+  char normalizedFingerprint[65];
+  if (media_remote::normalizeSha256Fingerprint(
+        tlsFingerprintParam.getValue(), normalizedFingerprint, sizeof(normalizedFingerprint))) {
+    strlcpy(config.tlsFingerprint, normalizedFingerprint, sizeof(config.tlsFingerprint));
+  } else {
+    config.tlsFingerprint[0] = '\0';
+  }
+
+  if (!normalizeAndValidateConfig()) {
+    drawCenteredMessage("Invalid configuration", "HTTPS needs SHA-256 pin");
+    Serial.println("Invalid HA URL, entity, token, or TLS fingerprint");
+    delay(4000);
+    ESP.restart();
+  }
 
   if (shouldSaveConfig || forceConfig) {
     saveConfig();
@@ -1137,36 +1222,74 @@ bool downloadAndDrawImage(const String &picture)
     return false;
   }
 
+  constexpr int maxRedirects = 3;
   String imageUrl = makeHaUrl(picture);
-  HTTPClient http;
-  if (!beginHttp(http, imageUrl)) {
-    return false;
-  }
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  if (isHaHostUrl(imageUrl)) {
-    http.addHeader("Authorization", "Bearer " + String(config.token));
-  }
-  int status = http.GET();
-  Serial.printf("GET image -> %d\n", status);
-  if (status != 200) {
-    Serial.printf("Image fetch failed: %d\n", status);
-    http.end();
-    return false;
+  String visited[maxRedirects + 1];
+  HTTPClient clients[maxRedirects + 1];
+  HTTPClient *http = nullptr;
+  int status = 0;
+
+  for (int hop = 0; hop <= maxRedirects; hop++) {
+    visited[hop] = imageUrl;
+    http = &clients[hop];
+    if (!beginHttp(*http, imageUrl)) {
+      return false;
+    }
+    if (isHaHostUrl(imageUrl)) {
+      http->addHeader("Authorization", "Bearer " + String(config.token));
+    }
+
+    status = http->GET();
+    Serial.printf("GET image hop %d -> %d\n", hop, status);
+    if (status == 200) {
+      break;
+    }
+
+    bool redirect = status == HTTP_CODE_MOVED_PERMANENTLY
+      || status == HTTP_CODE_FOUND
+      || status == HTTP_CODE_SEE_OTHER
+      || status == HTTP_CODE_TEMPORARY_REDIRECT
+      || status == HTTP_CODE_PERMANENT_REDIRECT;
+    if (!redirect || hop == maxRedirects) {
+      Serial.printf("Image fetch failed: %d\n", status);
+      http->end();
+      return false;
+    }
+
+    String location = http->getLocation();
+    char resolved[512];
+    if (!media_remote::resolveRedirectUrl(imageUrl.c_str(), location.c_str(), resolved, sizeof(resolved))
+        || !media_remote::redirectAllowed(imageUrl.c_str(), resolved)) {
+      Serial.println("Image redirect blocked");
+      drawStatusLine("Image redirect blocked", TFT_RED);
+      http->end();
+      return false;
+    }
+    for (int previous = 0; previous <= hop; previous++) {
+      if (visited[previous] == resolved) {
+        Serial.println("Image redirect loop blocked");
+        http->end();
+        return false;
+      }
+    }
+
+    http->end();
+    imageUrl = resolved;
   }
 
   // Decode straight from the HTTP stream with the low-level tjpgd API —
   // needs only a ~4 kB workspace, so cover size doesn't matter.
   JpegStreamCtx ctx;
-  ctx.stream = http.getStreamPtr();
-  ctx.http = &http;
-  ctx.remaining = http.getSize() > 0 ? http.getSize() : 0x7FFFFFFF;
+  ctx.stream = http->getStreamPtr();
+  ctx.http = http;
+  ctx.remaining = http->getSize() > 0 ? http->getSize() : 0x7FFFFFFF;
 
   static uint8_t jdWorkspace[3904];
   JDEC jdec;
   JRESULT result = jd_prepare(&jdec, jpgStreamIn, jdWorkspace, sizeof(jdWorkspace), &ctx);
   if (result != JDR_OK) {
     Serial.printf("Cover JPEG prepare failed: %d\n", (int)result);
-    http.end();
+    http->end();
     return false;
   }
   // Bodmer's tjpgd fork swaps RGB565 bytes inside the decoder; jd_prepare
@@ -1184,7 +1307,7 @@ bool downloadAndDrawImage(const String &picture)
 
   tft.fillRect(COVER_X, COVER_Y, COVER_SIZE, COVER_SIZE, TFT_BLACK);
   result = jd_decomp(&jdec, jpgStreamOut, scale);
-  http.end();
+  http->end();
 
   Serial.printf("Cover: %ux%u scale=1/%d result=%d\n", jdec.width, jdec.height, 1 << scale, (int)result);
   if (result != JDR_OK) {
@@ -1330,28 +1453,25 @@ void wsEvent(WStype_t type, uint8_t *payload, size_t length)
 void setupWebSocket()
 {
   String base = haBaseUrl();
-  bool tls = base.startsWith("https://");
-  String rest = base.substring(tls ? 8 : 7);
-  int slash = rest.indexOf('/');
-  if (slash >= 0) {
-    rest = rest.substring(0, slash);
+  media_remote::Origin origin = media_remote::parseHttpOrigin(base.c_str());
+  if (!origin.valid) {
+    drawStatusLine("Invalid HA URL", TFT_RED);
+    return;
   }
-  uint16_t port = tls ? 443 : 80;
-  String host = rest;
-  int colon = rest.indexOf(':');
-  if (colon >= 0) {
-    host = rest.substring(0, colon);
-    port = rest.substring(colon + 1).toInt();
-  }
+  bool tls = origin.scheme == media_remote::UrlScheme::Https;
 
-  Serial.printf("WS connecting to %s:%u (tls=%d)\n", host.c_str(), port, tls);
+  Serial.printf("WS connecting to %s:%u (tls=%d)\n", origin.host, origin.port, tls);
   ws.onEvent(wsEvent);
   ws.setReconnectInterval(5000);
   ws.enableHeartbeat(15000, 3000, 2);
   if (tls) {
-    ws.beginSSL(host.c_str(), port, "/api/websocket");
+    if (!config.tlsFingerprint[0]) {
+      drawStatusLine("TLS fingerprint missing", TFT_RED);
+      return;
+    }
+    ws.beginSSL(origin.host, origin.port, "/api/websocket", config.tlsFingerprint);
   } else {
-    ws.begin(host.c_str(), port, "/api/websocket");
+    ws.begin(origin.host, origin.port, "/api/websocket");
   }
 }
 

@@ -68,6 +68,47 @@ void testSameOriginPolicy()
   TEST_ASSERT_FALSE(sameOrigin(nullptr, "https://ha.local"));
 }
 
+void testSha256FingerprintNormalization()
+{
+  char output[65];
+  TEST_ASSERT_TRUE(normalizeSha256Fingerprint(
+    "00112233445566778899AABBCCDDEEFF00112233445566778899AABBCCDDEEFF", output, sizeof(output)));
+  TEST_ASSERT_EQUAL_STRING(
+    "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff", output);
+  TEST_ASSERT_TRUE(normalizeSha256Fingerprint(
+    "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF",
+    output, sizeof(output)));
+  TEST_ASSERT_EQUAL_STRING(
+    "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff", output);
+  TEST_ASSERT_FALSE(normalizeSha256Fingerprint("0011", output, sizeof(output)));
+  TEST_ASSERT_FALSE(normalizeSha256Fingerprint("", output, sizeof(output)));
+  TEST_ASSERT_FALSE(normalizeSha256Fingerprint(
+    "00112233445566778899AABBCCDDEEFF00112233445566778899AABBCCDDEEFG", output, sizeof(output)));
+  TEST_ASSERT_FALSE(normalizeSha256Fingerprint(nullptr, output, sizeof(output)));
+}
+
+void testRedirectPolicy()
+{
+  char output[256];
+  TEST_ASSERT_TRUE(resolveRedirectUrl("https://ha.local/api/image", "/cover.jpg", output, sizeof(output)));
+  TEST_ASSERT_EQUAL_STRING("https://ha.local/cover.jpg", output);
+  TEST_ASSERT_TRUE(resolveRedirectUrl("https://ha.local/api/image", "next.jpg", output, sizeof(output)));
+  TEST_ASSERT_EQUAL_STRING("https://ha.local/api/next.jpg", output);
+  TEST_ASSERT_TRUE(resolveRedirectUrl("https://ha.local/api/image", "//cdn.local/art.jpg", output, sizeof(output)));
+  TEST_ASSERT_EQUAL_STRING("https://cdn.local/art.jpg", output);
+  TEST_ASSERT_TRUE(resolveRedirectUrl(
+    "https://ha.local:8123/api/image", "https://cdn.local/art.jpg", output, sizeof(output)));
+  TEST_ASSERT_EQUAL_STRING("https://cdn.local/art.jpg", output);
+  TEST_ASSERT_TRUE(resolveRedirectUrl("http://[2001:db8::1]:8123/api/image", "/art", output, sizeof(output)));
+  TEST_ASSERT_EQUAL_STRING("http://[2001:db8::1]:8123/art", output);
+  TEST_ASSERT_FALSE(resolveRedirectUrl("https://ha.local/api/image", "ftp://cdn.local/art.jpg", output, sizeof(output)));
+
+  TEST_ASSERT_TRUE(redirectAllowed("https://ha.local/a", "https://cdn.local/b"));
+  TEST_ASSERT_TRUE(redirectAllowed("http://ha.local/a", "https://ha.local/b"));
+  TEST_ASSERT_FALSE(redirectAllowed("https://ha.local/a", "http://ha.local/b"));
+  TEST_ASSERT_FALSE(redirectAllowed("https://ha.local/a", "not-a-url"));
+}
+
 int main(int argc, char **argv)
 {
   UNITY_BEGIN();
@@ -75,5 +116,7 @@ int main(int argc, char **argv)
   RUN_TEST(testDeadlinesAndElapsedTime);
   RUN_TEST(testHttpOrigins);
   RUN_TEST(testSameOriginPolicy);
+  RUN_TEST(testSha256FingerprintNormalization);
+  RUN_TEST(testRedirectPolicy);
   return UNITY_END();
 }

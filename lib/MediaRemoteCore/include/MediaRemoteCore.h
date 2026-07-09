@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 namespace media_remote {
@@ -23,5 +24,8 @@ int progressBarWidth(int64_t progressMs, int64_t durationMs, int width);
 Origin parseHttpOrigin(const char *url);
 bool sameOrigin(const Origin &left, const Origin &right);
 bool sameOrigin(const char *leftUrl, const char *rightUrl);
+bool normalizeSha256Fingerprint(const char *input, char *output, size_t outputSize);
+bool resolveRedirectUrl(const char *currentUrl, const char *location, char *output, size_t outputSize);
+bool redirectAllowed(const char *currentUrl, const char *nextUrl);
 
 } // namespace media_remote

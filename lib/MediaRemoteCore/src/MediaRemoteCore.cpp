@@ -2,6 +2,7 @@
 
 #include <ctype.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 
 namespace media_remote {
@@ -60,6 +61,31 @@ bool copyHost(const char *start, const char *end, char *destination, size_t size
   }
   destination[length] = '\0';
   return true;
+}
+
+bool appendText(char *output, size_t outputSize, size_t *length, const char *start, size_t count)
+{
+  if (!output || !length || *length + count >= outputSize) {
+    return false;
+  }
+  memcpy(output + *length, start, count);
+  *length += count;
+  output[*length] = '\0';
+  return true;
+}
+
+char hexDigit(unsigned value)
+{
+  return value < 10 ? static_cast<char>('0' + value) : static_cast<char>('a' + value - 10);
+}
+
+int hexValue(char value)
+{
+  if (value >= '0' && value <= '9') {
+    return value - '0';
+  }
+  value = static_cast<char>(tolower(static_cast<unsigned char>(value)));
+  return value >= 'a' && value <= 'f' ? value - 'a' + 10 : -1;
 }
 
 } // namespace
@@ -183,6 +209,134 @@ bool sameOrigin(const Origin &left, const Origin &right)
 bool sameOrigin(const char *leftUrl, const char *rightUrl)
 {
   return sameOrigin(parseHttpOrigin(leftUrl), parseHttpOrigin(rightUrl));
+}
+
+bool normalizeSha256Fingerprint(const char *input, char *output, size_t outputSize)
+{
+  if (!input || !output || outputSize < 65) {
+    return false;
+  }
+
+  size_t written = 0;
+  int high = -1;
+  for (const char *cursor = input; *cursor; cursor++) {
+    if (*cursor == ':' || *cursor == ' ') {
+      continue;
+    }
+    int value = hexValue(*cursor);
+    if (value < 0 || written >= 64) {
+      output[0] = '\0';
+      return false;
+    }
+    if (high < 0) {
+      high = value;
+    } else {
+      output[written++] = hexDigit(static_cast<unsigned>(high));
+      output[written++] = hexDigit(static_cast<unsigned>(value));
+      high = -1;
+    }
+  }
+
+  if (written != 64 || high >= 0) {
+    output[0] = '\0';
+    return false;
+  }
+  output[written] = '\0';
+  return true;
+}
+
+bool resolveRedirectUrl(const char *currentUrl, const char *location, char *output, size_t outputSize)
+{
+  if (!currentUrl || !location || !output || outputSize == 0 || !*location) {
+    return false;
+  }
+  output[0] = '\0';
+
+  Origin currentOrigin = parseHttpOrigin(currentUrl);
+  if (!currentOrigin.valid) {
+    return false;
+  }
+
+  if (parseHttpOrigin(location).valid) {
+    size_t length = strlen(location);
+    if (length >= outputSize) {
+      return false;
+    }
+    memcpy(output, location, length + 1);
+    return true;
+  }
+
+  // A Location value that names another URI scheme is not a relative HTTP
+  // path. Reject it instead of accidentally keeping it on the current origin.
+  if (strstr(location, "://")) {
+    return false;
+  }
+
+  size_t length = 0;
+  const char *scheme = currentOrigin.scheme == UrlScheme::Https ? "https://" : "http://";
+  if (location[0] == '/' && location[1] == '/') {
+    return appendText(output, outputSize, &length, scheme, strlen(scheme) - 2)
+      && appendText(output, outputSize, &length, location, strlen(location));
+  }
+
+  if (!appendText(output, outputSize, &length, scheme, strlen(scheme))) {
+    return false;
+  }
+  bool ipv6 = strchr(currentOrigin.host, ':') != nullptr;
+  if (ipv6 && !appendText(output, outputSize, &length, "[", 1)) {
+    return false;
+  }
+  if (!appendText(output, outputSize, &length, currentOrigin.host, strlen(currentOrigin.host))) {
+    return false;
+  }
+  if (ipv6 && !appendText(output, outputSize, &length, "]", 1)) {
+    return false;
+  }
+  uint16_t defaultPort = currentOrigin.scheme == UrlScheme::Https ? 443 : 80;
+  if (currentOrigin.port != defaultPort) {
+    char portText[7];
+    int portLength = snprintf(portText, sizeof(portText), ":%u", currentOrigin.port);
+    if (portLength <= 0 || !appendText(output, outputSize, &length, portText, static_cast<size_t>(portLength))) {
+      return false;
+    }
+  }
+
+  if (location[0] == '/') {
+    return appendText(output, outputSize, &length, location, strlen(location));
+  }
+
+  const char *path = strstr(currentUrl, "://");
+  path = path ? strchr(path + 3, '/') : nullptr;
+  if (!path) {
+    if (!appendText(output, outputSize, &length, "/", 1)) {
+      return false;
+    }
+  } else {
+    const char *pathEnd = path;
+    while (*pathEnd && *pathEnd != '?' && *pathEnd != '#') {
+      pathEnd++;
+    }
+    const char *lastSlash = path;
+    for (const char *cursor = path; cursor < pathEnd; cursor++) {
+      if (*cursor == '/') {
+        lastSlash = cursor;
+      }
+    }
+    if (!appendText(output, outputSize, &length, path, static_cast<size_t>(lastSlash - path + 1))) {
+      return false;
+    }
+  }
+  return appendText(output, outputSize, &length, location, strlen(location));
+}
+
+bool redirectAllowed(const char *currentUrl, const char *nextUrl)
+{
+  Origin current = parseHttpOrigin(currentUrl);
+  Origin next = parseHttpOrigin(nextUrl);
+  if (!current.valid || !next.valid) {
+    return false;
+  }
+  return !(current.scheme == UrlScheme::Https && next.scheme == UrlScheme::Http);
 }
 
 } // namespace media_remote
