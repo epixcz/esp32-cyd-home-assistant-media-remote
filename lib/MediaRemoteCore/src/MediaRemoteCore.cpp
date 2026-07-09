@@ -339,4 +339,52 @@ bool redirectAllowed(const char *currentUrl, const char *nextUrl)
   return !(current.scheme == UrlScheme::Https && next.scheme == UrlScheme::Http);
 }
 
+bool isValidOtaPassword(const char *password, size_t bufferSize)
+{
+  if (!password || bufferSize < 2) {
+    return false;
+  }
+
+  size_t length = 0;
+  while (length < bufferSize && password[length]) {
+    length++;
+  }
+  return length >= 12 && length < bufferSize;
+}
+
+bool isValidMd5Hash(const char *hash)
+{
+  if (!hash) {
+    return false;
+  }
+  for (size_t index = 0; index < 32; index++) {
+    if (!hash[index] || hexValue(hash[index]) < 0) {
+      return false;
+    }
+  }
+  return hash[32] == '\0';
+}
+
+CredentialAction resolveHaTokenInput(bool hasExistingToken, const char *newToken)
+{
+  if (newToken && newToken[0]) {
+    return CredentialAction::Replace;
+  }
+  return hasExistingToken ? CredentialAction::Keep : CredentialAction::Invalid;
+}
+
+CredentialAction resolveOtaInput(
+  bool enabled, bool hasExistingHash, const char *newPassword, size_t passwordBufferSize)
+{
+  if (!enabled) {
+    return CredentialAction::Clear;
+  }
+  if (!newPassword || !newPassword[0]) {
+    return hasExistingHash ? CredentialAction::Keep : CredentialAction::Invalid;
+  }
+  return isValidOtaPassword(newPassword, passwordBufferSize)
+    ? CredentialAction::Replace
+    : CredentialAction::Invalid;
+}
+
 } // namespace media_remote

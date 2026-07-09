@@ -15,7 +15,7 @@ An ESP32 touch-screen remote for a Home Assistant `media_player` entity (Spotify
 - **Diacritics-safe text** — UTF-8 titles are transliterated to ASCII (č→c, ř→r, …) for the bitmap fonts
 - **Auto-dimming backlight** — full brightness while playing or after a touch, dimmed when idle
 - **WiFiManager captive portal** for all configuration (no secrets in the source)
-- **OTA updates** after the first USB flash
+- **Opt-in OTA updates** with a separate per-device password
 - Robust reconnect handling for both Wi-Fi and the WebSocket
 
 ## Supported boards
@@ -52,7 +52,7 @@ pio run -e esp32_3248s035c -t upload
 On first boot the device starts a Wi-Fi access point:
 
 - **SSID:** `CYD-HA-Media`
-- **Password:** `cydmedia`
+- **Password:** a new random value shown only on the device display
 
 Connect to it and the portal opens automatically (or visit `http://192.168.4.1`). Fill in:
 
@@ -63,8 +63,14 @@ Connect to it and the portal opens automatically (or visit `http://192.168.4.1`)
 | HA token | the long-lived token from step 1 |
 | media_player entity | `media_player.spotify_your_name` |
 | HA TLS SHA-256 fingerprint | required only for an `https://` HA URL |
+| Enable OTA | off by default; enable only when OTA updates are needed |
+| New OTA password | at least 12 characters; required when first enabling OTA |
 
-The configuration is stored on the device (LittleFS). To reopen the portal later, hold the **BOOT** button while pressing reset.
+The configuration is stored on the device (LittleFS). To reopen the portal
+later, hold the **BOOT** button while pressing reset. Every portal session gets
+a new random access-point password. When editing an existing configuration,
+leave the HA token and OTA password fields blank to keep their current values;
+the existing secrets are never rendered into the page.
 
 Plain HTTP is supported for a trusted LAN, but it does not protect the HA token
 from another device able to observe that network. HTTPS verifies both the HA
@@ -87,17 +93,30 @@ the bearer token is sent.
 
 ### 4. OTA updates (optional)
 
-After the first USB flash you can update over Wi-Fi. Add an OTA environment to `platformio.ini` (adjust the IP to your device — it is shown on the display at boot):
+OTA is disabled by default. Reopen the portal with the physical **BOOT** button,
+enable OTA and set a new password of at least 12 characters. Only its MD5 hash,
+which is required by ArduinoOTA authentication, is stored on the device.
 
-```ini
-[env:esp32_3248s035c_ota]
-extends = env:esp32_3248s035c
-upload_protocol = espota
-upload_port = 192.168.2.139
-upload_flags = --auth=cydmedia
+Set the target and plaintext password only in your local shell before upload:
+
+```sh
+export CYD_OTA_HOST='device-ip-or-hostname'
+export CYD_OTA_PASSWORD='your-new-device-specific-password'
+
+# 2.8" board
+pio run -e cyd_ota -t upload
+
+# 3.5" board
+pio run -e esp32_3248s035c_ota -t upload
 ```
 
-Then: `pio run -e esp32_3248s035c_ota -t upload`. The OTA password equals the AP password (`AP_PASSWORD` in `src/main.cpp`).
+After installing this version, the former shared OTA setup is disabled by
+migration. Flash once over USB if necessary, then use the BOOT portal to opt in
+with a new device-specific password. Disabling OTA in the portal removes the
+stored hash and stops the OTA service. If a configuration is lost or invalid,
+the BOOT portal remains the recovery path. Rotate the HA token only when the
+portal was exposed in an untrusted environment or there is another concrete
+reason to suspect disclosure.
 
 ## Faster updates for external changes (recommended)
 
@@ -145,11 +164,11 @@ pio test -c platformio.test.ini -e native
 pio run -e cyd -e cyd2usb -e diag -e esp32_3248s035c -e diag_esp32_3248s035c -e touchdiag_esp32_3248s035c
 ```
 
-The native suite covers overflow-safe progress, timer rollover and URL-origin
-policy without hardware. The six firmware environments cover both production
-board variants and all diagnostic firmwares. Dependency updates should be made
-separately from feature changes, then verified with the native suite, full
-build matrix and a smoke test on both physical boards.
+The native suite covers overflow-safe progress, timer rollover, URL-origin and
+credential-update policies without hardware. The six firmware environments
+cover both production board variants and all diagnostic firmwares. Dependency
+updates should be made separately from feature changes, then verified with the
+native suite, full build matrix and a smoke test on both physical boards.
 
 Everything lives in `src/main.cpp`; the board-specific layout constants are at the top of the main firmware section, guarded by `PANEL_*` defines. Diagnostic firmwares are selected with the `DIAGNOSTIC_TFT` / `DIAGNOSTIC_GT911` build flags (see `platformio.ini`).
 
@@ -177,3 +196,10 @@ Notes for contributors:
   rejected, and native policy tests cover fingerprint and redirect handling.
   The audit plan mentioned SHA-1, but the pinned ESP32 framework actually
   verifies SHA-256; the implementation follows the framework's stronger API.
+- **Plan 004 — isolated provisioning and OTA credentials:** every captive-portal
+  session now uses a random RAM-only password displayed on the TFT, secret form
+  fields are never prefilled, and blank edits safely retain existing values.
+  OTA is disabled for old and new configurations until explicitly enabled with
+  a separate password; only its ArduinoOTA-compatible hash is persisted. OTA
+  upload host and plaintext authentication now come from local environment
+  variables instead of tracked project values.

@@ -4,6 +4,7 @@
 #include <FS.h>
 #include <HTTPClient.h>
 #include <LittleFS.h>
+#include <MD5Builder.h>
 #include <TJpg_Decoder.h>
 #include <TFT_eSPI.h>
 #include <WiFi.h>
@@ -14,6 +15,7 @@
 #include <Wire.h>
 #include <time.h>
 #include <sys/time.h>
+#include <esp_system.h>
 
 #include <MediaRemoteCore.h>
 
@@ -283,7 +285,6 @@ void loop()
 
 #define CONFIG_FILE "/ha_media_config.json"
 #define AP_NAME "CYD-HA-Media"
-#define AP_PASSWORD "cydmedia"
 
 #if defined(PANEL_ESP32_3248S035C)
 #define SCREEN_W 480
@@ -344,6 +345,8 @@ struct AppConfig {
   char token[384];
   char entityId[80];
   char tlsFingerprint[65];
+  bool otaEnabled;
+  char otaPasswordHash[33];
 };
 
 struct MediaState {
@@ -384,6 +387,8 @@ unsigned long volumeModalOpenedAt = 0;
 unsigned long lastTouchAt = 0;
 unsigned long lastWifiAttemptAt = 0;
 bool wifiWasDown = false;
+bool otaReady = false;
+char provisioningPassword[17] = {0};
 const unsigned long pollIntervalMs = 3000;
 // With a live WebSocket subscription the poll is only a safety net.
 const unsigned long wsPollIntervalMs = 60000;
@@ -503,6 +508,42 @@ bool isHaHostUrl(const String &url)
   return media_remote::sameOrigin(haBaseUrl().c_str(), absoluteUrl.c_str());
 }
 
+void secureClear(char *buffer, size_t size)
+{
+  volatile char *cursor = buffer;
+  while (cursor && size-- > 0) {
+    *cursor++ = '\0';
+  }
+}
+
+void generateProvisioningPassword()
+{
+  static const char alphabet[] = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+  constexpr size_t alphabetSize = sizeof(alphabet) - 1;
+  constexpr uint8_t unbiasedLimit = 256 - (256 % alphabetSize);
+
+  size_t written = 0;
+  while (written < sizeof(provisioningPassword) - 1) {
+    uint8_t randomByte;
+    esp_fill_random(&randomByte, sizeof(randomByte));
+    if (randomByte >= unbiasedLimit) {
+      continue;
+    }
+    provisioningPassword[written++] = alphabet[randomByte % alphabetSize];
+  }
+  provisioningPassword[written] = '\0';
+}
+
+void hashOtaPassword(const char *password, char output[33])
+{
+  MD5Builder md5;
+  md5.begin();
+  md5.add(password);
+  md5.calculate();
+  String hash = md5.toString();
+  strlcpy(output, hash.c_str(), 33);
+}
+
 bool normalizeAndValidateConfig()
 {
   media_remote::Origin origin = media_remote::parseHttpOrigin(config.haUrl);
@@ -522,6 +563,11 @@ bool normalizeAndValidateConfig()
       return false;
     }
     strlcpy(config.tlsFingerprint, normalized, sizeof(config.tlsFingerprint));
+  }
+
+  if (!config.otaEnabled || !media_remote::isValidMd5Hash(config.otaPasswordHash)) {
+    config.otaEnabled = false;
+    secureClear(config.otaPasswordHash, sizeof(config.otaPasswordHash));
   }
   return true;
 }
@@ -765,7 +811,7 @@ void drawWifiManagerMessage(WiFiManager *manager)
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.drawString("Password:", 12, 72, 2);
   tft.setTextColor(TFT_GREEN, TFT_BLACK);
-  tft.drawString(AP_PASSWORD, 92, 72, 2);
+  tft.drawString(provisioningPassword, 92, 72, 2);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.drawString("Open the captive portal", 12, 116, 2);
   tft.drawString("or visit:", 12, 138, 2);
@@ -924,6 +970,8 @@ bool loadConfig()
   strlcpy(config.token, doc["token"] | "", sizeof(config.token));
   strlcpy(config.entityId, doc["entityId"] | "", sizeof(config.entityId));
   strlcpy(config.tlsFingerprint, doc["tlsFingerprint"] | "", sizeof(config.tlsFingerprint));
+  config.otaEnabled = doc["otaEnabled"] | false;
+  strlcpy(config.otaPasswordHash, doc["otaPasswordHash"] | "", sizeof(config.otaPasswordHash));
 
   return normalizeAndValidateConfig();
 }
@@ -935,6 +983,8 @@ void saveConfig()
   doc["token"] = config.token;
   doc["entityId"] = config.entityId;
   doc["tlsFingerprint"] = config.tlsFingerprint;
+  doc["otaEnabled"] = config.otaEnabled;
+  doc["otaPasswordHash"] = config.otaEnabled ? config.otaPasswordHash : "";
 
   File file = LittleFS.open(CONFIG_FILE, "w");
   if (!file) {
@@ -953,6 +1003,7 @@ void saveConfigCallback()
 void setupWiFiAndConfig(bool forceConfig)
 {
   WiFiManager wm;
+  wm.setDebugOutput(false);
   wm.setSaveConfigCallback(saveConfigCallback);
   wm.setAPCallback(drawWifiManagerMessage);
 
@@ -960,44 +1011,96 @@ void setupWiFiAndConfig(bool forceConfig)
   strlcpy(tlsFingerprintInput, config.tlsFingerprint, sizeof(tlsFingerprintInput));
 
   WiFiManagerParameter haUrlParam("ha_url", "HA URL", config.haUrl, sizeof(config.haUrl));
-  WiFiManagerParameter tokenParam("ha_token", "HA token", config.token, sizeof(config.token));
+  WiFiManagerParameter tokenParam(
+    "ha_token", "New HA token (blank keeps current)", "", sizeof(config.token) - 1,
+    "type=\"password\" autocomplete=\"new-password\"");
   WiFiManagerParameter entityParam("entity_id", "media_player entity", config.entityId, sizeof(config.entityId));
   WiFiManagerParameter tlsFingerprintParam(
     "ha_tls_fp", "HA TLS SHA-256 fingerprint", tlsFingerprintInput, sizeof(tlsFingerprintInput));
+  const char *otaCheckboxAttributes = config.otaEnabled ? "type=\"checkbox\" checked" : "type=\"checkbox\"";
+  WiFiManagerParameter otaEnabledParam(
+    "ota_enabled", "Enable OTA", "1", 1, otaCheckboxAttributes, WFM_LABEL_AFTER);
+  WiFiManagerParameter otaPasswordParam(
+    "ota_password", "New OTA password (min. 12; blank keeps current)", "", 64,
+    "type=\"password\" autocomplete=\"new-password\"");
 
   wm.addParameter(&haUrlParam);
   wm.addParameter(&tokenParam);
   wm.addParameter(&entityParam);
   wm.addParameter(&tlsFingerprintParam);
+  wm.addParameter(&otaEnabledParam);
+  wm.addParameter(&otaPasswordParam);
 
-  bool connected = forceConfig
-    ? wm.startConfigPortal(AP_NAME, AP_PASSWORD)
-    : wm.autoConnect(AP_NAME, AP_PASSWORD);
+  generateProvisioningPassword();
+  bool requirePortal = forceConfig;
+  while (true) {
+    shouldSaveConfig = false;
+    bool connected = requirePortal
+      ? wm.startConfigPortal(AP_NAME, provisioningPassword)
+      : wm.autoConnect(AP_NAME, provisioningPassword);
 
-  if (!connected) {
-    ESP.restart();
-  }
+    if (!connected) {
+      secureClear(provisioningPassword, sizeof(provisioningPassword));
+      ESP.restart();
+    }
+    if (!shouldSaveConfig) {
+      secureClear(provisioningPassword, sizeof(provisioningPassword));
+      return;
+    }
 
-  strlcpy(config.haUrl, haUrlParam.getValue(), sizeof(config.haUrl));
-  strlcpy(config.token, tokenParam.getValue(), sizeof(config.token));
-  strlcpy(config.entityId, entityParam.getValue(), sizeof(config.entityId));
-  char normalizedFingerprint[65];
-  if (media_remote::normalizeSha256Fingerprint(
-        tlsFingerprintParam.getValue(), normalizedFingerprint, sizeof(normalizedFingerprint))) {
-    strlcpy(config.tlsFingerprint, normalizedFingerprint, sizeof(config.tlsFingerprint));
-  } else {
-    config.tlsFingerprint[0] = '\0';
-  }
+    AppConfig previous = config;
+    AppConfig proposed = config;
+    strlcpy(proposed.haUrl, haUrlParam.getValue(), sizeof(proposed.haUrl));
+    strlcpy(proposed.entityId, entityParam.getValue(), sizeof(proposed.entityId));
 
-  if (!normalizeAndValidateConfig()) {
-    drawCenteredMessage("Invalid configuration", "HTTPS needs SHA-256 pin");
-    Serial.println("Invalid HA URL, entity, token, or TLS fingerprint");
-    delay(4000);
-    ESP.restart();
-  }
+    char normalizedFingerprint[65];
+    if (media_remote::normalizeSha256Fingerprint(
+          tlsFingerprintParam.getValue(), normalizedFingerprint, sizeof(normalizedFingerprint))) {
+      strlcpy(proposed.tlsFingerprint, normalizedFingerprint, sizeof(proposed.tlsFingerprint));
+    } else {
+      proposed.tlsFingerprint[0] = '\0';
+    }
 
-  if (shouldSaveConfig || forceConfig) {
-    saveConfig();
+    media_remote::CredentialAction tokenAction = media_remote::resolveHaTokenInput(
+      previous.token[0] != '\0', tokenParam.getValue());
+    if (tokenAction == media_remote::CredentialAction::Replace) {
+      strlcpy(proposed.token, tokenParam.getValue(), sizeof(proposed.token));
+    }
+
+    bool requestedOta = strcmp(otaEnabledParam.getValue(), "1") == 0;
+    bool hasOtaHash = media_remote::isValidMd5Hash(previous.otaPasswordHash);
+    media_remote::CredentialAction otaAction = media_remote::resolveOtaInput(
+      requestedOta, hasOtaHash, otaPasswordParam.getValue(), otaPasswordParam.getValueLength() + 1);
+    if (otaAction == media_remote::CredentialAction::Replace) {
+      hashOtaPassword(otaPasswordParam.getValue(), proposed.otaPasswordHash);
+      proposed.otaEnabled = true;
+    } else if (otaAction == media_remote::CredentialAction::Keep) {
+      proposed.otaEnabled = true;
+    } else if (otaAction == media_remote::CredentialAction::Clear) {
+      proposed.otaEnabled = false;
+      secureClear(proposed.otaPasswordHash, sizeof(proposed.otaPasswordHash));
+    }
+
+    secureClear(const_cast<char *>(tokenParam.getValue()), tokenParam.getValueLength() + 1);
+    secureClear(const_cast<char *>(otaPasswordParam.getValue()), otaPasswordParam.getValueLength() + 1);
+
+    config = proposed;
+    bool valid = tokenAction != media_remote::CredentialAction::Invalid
+      && otaAction != media_remote::CredentialAction::Invalid
+      && normalizeAndValidateConfig();
+    if (valid) {
+      saveConfig();
+      secureClear(provisioningPassword, sizeof(provisioningPassword));
+      return;
+    }
+
+    config = previous;
+    tokenParam.setValue("", sizeof(config.token) - 1);
+    otaPasswordParam.setValue("", 64);
+    drawCenteredMessage("Invalid configuration", "Check token, TLS and OTA");
+    Serial.println("Configuration rejected; reopening portal");
+    delay(2500);
+    requirePortal = true;
   }
 }
 
@@ -1621,16 +1724,23 @@ void setup()
   // UTC only — parseIso8601Ms relies on mktime() treating struct tm as UTC.
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
 
-  // unique per device so two boards on one network don't collide in mDNS
-  char otaHostname[32];
-  snprintf(otaHostname, sizeof(otaHostname), "cyd-ha-media-%04x",
-    (unsigned)(ESP.getEfuseMac() & 0xFFFF));
-  ArduinoOTA.setHostname(otaHostname);
-  ArduinoOTA.setPassword(AP_PASSWORD);
-  ArduinoOTA.onStart([]() {
-    drawCenteredMessage("OTA update", "Uploading...");
-  });
-  ArduinoOTA.begin();
+  if (config.otaEnabled && media_remote::isValidMd5Hash(config.otaPasswordHash)) {
+    // Unique per device so two boards on one network don't collide in mDNS.
+    char otaHostname[32];
+    snprintf(otaHostname, sizeof(otaHostname), "cyd-ha-media-%04x",
+      (unsigned)(ESP.getEfuseMac() & 0xFFFF));
+    ArduinoOTA.setHostname(otaHostname);
+    ArduinoOTA.setPasswordHash(config.otaPasswordHash);
+    ArduinoOTA.onStart([]() {
+      drawCenteredMessage("OTA update", "Uploading...");
+    });
+    ArduinoOTA.begin();
+    otaReady = true;
+    Serial.println("OTA ready");
+  } else {
+    otaReady = false;
+    Serial.println("OTA disabled");
+  }
 
   Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
@@ -1640,6 +1750,8 @@ void setup()
   Serial.println(config.entityId);
 
   drawBaseInterface();
+  drawStatusLine(otaReady ? "OTA ready" : "OTA disabled", otaReady ? TFT_GREEN : TFT_LIGHTGREY);
+  delay(400);
   drawStatusLine("WiFi " + WiFi.localIP().toString(), TFT_GREEN);
   delay(500);
   drawStatusLine("Fetching HA state...");
@@ -1655,7 +1767,9 @@ void setup()
 
 void loop()
 {
-  ArduinoOTA.handle();
+  if (otaReady) {
+    ArduinoOTA.handle();
+  }
   handleTouch();
   updateBacklight();
 

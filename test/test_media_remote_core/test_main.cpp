@@ -2,6 +2,7 @@
 #include <unity.h>
 
 #include <stdint.h>
+#include <string.h>
 
 using namespace media_remote;
 
@@ -109,6 +110,30 @@ void testRedirectPolicy()
   TEST_ASSERT_FALSE(redirectAllowed("https://ha.local/a", "not-a-url"));
 }
 
+void testCredentialPolicy()
+{
+  TEST_ASSERT_EQUAL(CredentialAction::Invalid, resolveHaTokenInput(false, ""));
+  TEST_ASSERT_EQUAL(CredentialAction::Invalid, resolveHaTokenInput(false, nullptr));
+  TEST_ASSERT_EQUAL(CredentialAction::Replace, resolveHaTokenInput(false, "synthetic-token"));
+  TEST_ASSERT_EQUAL(CredentialAction::Keep, resolveHaTokenInput(true, ""));
+  TEST_ASSERT_EQUAL(CredentialAction::Replace, resolveHaTokenInput(true, "replacement-token"));
+
+  TEST_ASSERT_EQUAL(CredentialAction::Clear, resolveOtaInput(false, false, "", 65));
+  TEST_ASSERT_EQUAL(CredentialAction::Clear, resolveOtaInput(false, true, "ignored-password", 65));
+  TEST_ASSERT_EQUAL(CredentialAction::Invalid, resolveOtaInput(true, false, "", 65));
+  TEST_ASSERT_EQUAL(CredentialAction::Keep, resolveOtaInput(true, true, "", 65));
+  TEST_ASSERT_EQUAL(CredentialAction::Replace, resolveOtaInput(true, false, "twelve-chars", 65));
+  TEST_ASSERT_EQUAL(CredentialAction::Invalid, resolveOtaInput(true, false, "too-short", 65));
+
+  char unterminated[13];
+  memset(unterminated, 'x', sizeof(unterminated));
+  TEST_ASSERT_FALSE(isValidOtaPassword(unterminated, sizeof(unterminated)));
+  TEST_ASSERT_FALSE(isValidOtaPassword(nullptr, 65));
+  TEST_ASSERT_TRUE(isValidMd5Hash("0123456789abcdef0123456789ABCDEF"));
+  TEST_ASSERT_FALSE(isValidMd5Hash("0123456789abcdef0123456789abcde"));
+  TEST_ASSERT_FALSE(isValidMd5Hash("0123456789abcdef0123456789abcdeg"));
+}
+
 int main(int argc, char **argv)
 {
   UNITY_BEGIN();
@@ -118,5 +143,6 @@ int main(int argc, char **argv)
   RUN_TEST(testSameOriginPolicy);
   RUN_TEST(testSha256FingerprintNormalization);
   RUN_TEST(testRedirectPolicy);
+  RUN_TEST(testCredentialPolicy);
   return UNITY_END();
 }
