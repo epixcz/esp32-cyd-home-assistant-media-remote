@@ -134,6 +134,65 @@ void testCredentialPolicy()
   TEST_ASSERT_FALSE(isValidMd5Hash("0123456789abcdef0123456789abcdeg"));
 }
 
+void assertClip(
+  const Rect &block, int originX, int originY, const Rect &viewport, const Rect &screen,
+  bool visible, int x = 0, int y = 0, int width = 0, int height = 0, int sourceX = 0, int sourceY = 0)
+{
+  ClippedBlock result;
+  bool valid = clipDecodedBlock(block, originX, originY, viewport, screen, &result);
+  TEST_ASSERT_EQUAL(visible, valid);
+  TEST_ASSERT_EQUAL(visible, result.visible);
+  if (visible) {
+    TEST_ASSERT_EQUAL_INT(x, result.destination.x);
+    TEST_ASSERT_EQUAL_INT(y, result.destination.y);
+    TEST_ASSERT_EQUAL_INT(width, result.destination.width);
+    TEST_ASSERT_EQUAL_INT(height, result.destination.height);
+    TEST_ASSERT_EQUAL_INT(sourceX, result.sourceX);
+    TEST_ASSERT_EQUAL_INT(sourceY, result.sourceY);
+  }
+}
+
+void testInputBudgetPolicy()
+{
+  TEST_ASSERT_EQUAL(InputResult::Ok, checkInputBudget(100, 50, 90, 9, 10, 1000, 3000));
+  TEST_ASSERT_EQUAL(InputResult::TooLarge, checkInputBudget(100, 50, 90, 10, 10, 1000, 3000));
+  TEST_ASSERT_EQUAL(InputResult::Timeout, checkInputBudget(3050, 50, 3000, 1, 10, 3000, 3000));
+  TEST_ASSERT_EQUAL(InputResult::Timeout, checkInputBudget(3090, 100, 90, 1, 10, 0, 3000));
+  TEST_ASSERT_EQUAL(InputResult::Ok, checkInputBudget(4, UINT32_MAX - 5, 2, 1, 10, 20, 10));
+}
+
+void testClipDecodedBlocks()
+{
+  Rect screen = {0, 0, 320, 240};
+  Rect cover88 = {10, 42, 88, 88};
+
+  assertClip({0, 0, 40, 30}, 20, 50, cover88, screen, true, 20, 50, 40, 30);
+  assertClip({0, 0, 30, 20}, 0, 50, cover88, screen, true, 10, 50, 20, 20, 10, 0);
+  assertClip({0, 0, 30, 20}, 85, 50, cover88, screen, true, 85, 50, 13, 20);
+  assertClip({0, 0, 20, 30}, 20, 30, cover88, screen, true, 20, 42, 20, 18, 0, 12);
+  assertClip({0, 0, 20, 30}, 20, 120, cover88, screen, true, 20, 120, 20, 10);
+  assertClip({0, 0, 30, 30}, 0, 30, cover88, screen, true, 10, 42, 20, 18, 10, 12);
+  assertClip({0, 0, 10, 10}, -20, 50, cover88, screen, false);
+  assertClip({0, 0, 10, 10}, 100, 50, cover88, screen, false);
+  assertClip({0, 0, 10, 10}, 20, 20, cover88, screen, false);
+  assertClip({0, 0, 10, 10}, 20, 140, cover88, screen, false);
+
+  // 1000 px decoded at 1/8 becomes 125 px and is center-cropped to 88 px.
+  assertClip({0, 0, 125, 80}, -8, 46, cover88, screen, true, 10, 46, 88, 80, 18, 0);
+
+  Rect wideScreen = {0, 0, 480, 320};
+  Rect cover164 = {158, 26, 164, 164};
+  // 2048 px decoded at 1/8 becomes 256 px and is center-cropped to 164 px.
+  assertClip({0, 0, 256, 100}, 112, 58, cover164, wideScreen, true, 158, 58, 164, 100, 46, 0);
+  assertClip({0, 0, 100, 256}, 190, -20, cover164, wideScreen, true, 190, 26, 100, 164, 0, 46);
+
+  Rect screenInsideViewport = {20, 20, 50, 50};
+  assertClip({0, 0, 80, 80}, 0, 0, {0, 0, 100, 100}, screenInsideViewport,
+    true, 20, 20, 50, 50, 20, 20);
+  assertClip({-1, 0, 10, 10}, 20, 20, cover88, screen, false);
+  TEST_ASSERT_FALSE(clipDecodedBlock({0, 0, 10, 10}, 0, 0, cover88, screen, nullptr));
+}
+
 int main(int argc, char **argv)
 {
   UNITY_BEGIN();
@@ -144,5 +203,7 @@ int main(int argc, char **argv)
   RUN_TEST(testSha256FingerprintNormalization);
   RUN_TEST(testRedirectPolicy);
   RUN_TEST(testCredentialPolicy);
+  RUN_TEST(testInputBudgetPolicy);
+  RUN_TEST(testClipDecodedBlocks);
   return UNITY_END();
 }

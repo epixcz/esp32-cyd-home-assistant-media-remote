@@ -25,6 +25,30 @@ enum class CredentialAction : uint8_t {
   Clear,
 };
 
+enum class InputResult : uint8_t {
+  Ok,
+  TransportError,
+  TooLarge,
+  Timeout,
+  InvalidType,
+  DecodeError,
+  JsonError,
+};
+
+struct Rect {
+  int32_t x;
+  int32_t y;
+  int32_t width;
+  int32_t height;
+};
+
+struct ClippedBlock {
+  bool visible;
+  Rect destination;
+  int32_t sourceX;
+  int32_t sourceY;
+};
+
 bool deadlineReached(uint32_t now, uint32_t deadline);
 uint32_t elapsedMs(uint32_t now, uint32_t startedAt);
 int progressBarWidth(int64_t progressMs, int64_t durationMs, int width);
@@ -39,5 +63,11 @@ bool isValidMd5Hash(const char *hash);
 CredentialAction resolveHaTokenInput(bool hasExistingToken, const char *newToken);
 CredentialAction resolveOtaInput(
   bool enabled, bool hasExistingHash, const char *newPassword, size_t passwordBufferSize);
+InputResult checkInputBudget(
+  uint32_t now, uint32_t startedAt, uint32_t lastByteAt, size_t bytesRead,
+  size_t maxBytes, uint32_t totalTimeoutMs, uint32_t idleTimeoutMs);
+bool clipDecodedBlock(
+  const Rect &sourceBlock, int32_t destinationOriginX, int32_t destinationOriginY,
+  const Rect &viewport, const Rect &screen, ClippedBlock *output);
 
 } // namespace media_remote

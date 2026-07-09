@@ -387,4 +387,77 @@ CredentialAction resolveOtaInput(
     : CredentialAction::Invalid;
 }
 
+InputResult checkInputBudget(
+  uint32_t now, uint32_t startedAt, uint32_t lastByteAt, size_t bytesRead,
+  size_t maxBytes, uint32_t totalTimeoutMs, uint32_t idleTimeoutMs)
+{
+  if (totalTimeoutMs > 0 && elapsedMs(now, startedAt) >= totalTimeoutMs) {
+    return InputResult::Timeout;
+  }
+  if (idleTimeoutMs > 0 && elapsedMs(now, lastByteAt) >= idleTimeoutMs) {
+    return InputResult::Timeout;
+  }
+  if (bytesRead >= maxBytes) {
+    return InputResult::TooLarge;
+  }
+  return InputResult::Ok;
+}
+
+bool clipDecodedBlock(
+  const Rect &sourceBlock, int32_t destinationOriginX, int32_t destinationOriginY,
+  const Rect &viewport, const Rect &screen, ClippedBlock *output)
+{
+  if (!output) {
+    return false;
+  }
+  *output = {false, {0, 0, 0, 0}, 0, 0};
+  if (sourceBlock.x < 0 || sourceBlock.y < 0 || sourceBlock.width <= 0 || sourceBlock.height <= 0
+      || viewport.width <= 0 || viewport.height <= 0 || screen.width <= 0 || screen.height <= 0) {
+    return false;
+  }
+
+  int64_t destinationLeft = static_cast<int64_t>(destinationOriginX) + sourceBlock.x;
+  int64_t destinationTop = static_cast<int64_t>(destinationOriginY) + sourceBlock.y;
+  int64_t destinationRight = destinationLeft + sourceBlock.width;
+  int64_t destinationBottom = destinationTop + sourceBlock.height;
+  int64_t viewportRight = static_cast<int64_t>(viewport.x) + viewport.width;
+  int64_t viewportBottom = static_cast<int64_t>(viewport.y) + viewport.height;
+  int64_t screenRight = static_cast<int64_t>(screen.x) + screen.width;
+  int64_t screenBottom = static_cast<int64_t>(screen.y) + screen.height;
+
+  if (destinationRight <= destinationLeft || destinationBottom <= destinationTop
+      || viewportRight <= viewport.x || viewportBottom <= viewport.y
+      || screenRight <= screen.x || screenBottom <= screen.y) {
+    return false;
+  }
+
+  int64_t visibleLeft = destinationLeft > viewport.x ? destinationLeft : viewport.x;
+  visibleLeft = visibleLeft > screen.x ? visibleLeft : screen.x;
+  int64_t visibleTop = destinationTop > viewport.y ? destinationTop : viewport.y;
+  visibleTop = visibleTop > screen.y ? visibleTop : screen.y;
+  int64_t visibleRight = destinationRight < viewportRight ? destinationRight : viewportRight;
+  visibleRight = visibleRight < screenRight ? visibleRight : screenRight;
+  int64_t visibleBottom = destinationBottom < viewportBottom ? destinationBottom : viewportBottom;
+  visibleBottom = visibleBottom < screenBottom ? visibleBottom : screenBottom;
+
+  if (visibleLeft >= visibleRight || visibleTop >= visibleBottom
+      || visibleLeft < INT32_MIN || visibleLeft > INT32_MAX
+      || visibleTop < INT32_MIN || visibleTop > INT32_MAX
+      || visibleRight - visibleLeft > INT32_MAX || visibleBottom - visibleTop > INT32_MAX
+      || visibleLeft - destinationLeft > INT32_MAX || visibleTop - destinationTop > INT32_MAX) {
+    return false;
+  }
+
+  output->visible = true;
+  output->destination = {
+    static_cast<int32_t>(visibleLeft),
+    static_cast<int32_t>(visibleTop),
+    static_cast<int32_t>(visibleRight - visibleLeft),
+    static_cast<int32_t>(visibleBottom - visibleTop),
+  };
+  output->sourceX = static_cast<int32_t>(visibleLeft - destinationLeft);
+  output->sourceY = static_cast<int32_t>(visibleTop - destinationTop);
+  return true;
+}
+
 } // namespace media_remote

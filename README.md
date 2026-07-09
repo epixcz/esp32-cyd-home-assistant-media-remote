@@ -9,7 +9,8 @@ An ESP32 touch-screen remote for a Home Assistant `media_player` entity (Spotify
 ## Features
 
 - **Live updates over WebSocket** — subscribes to the Home Assistant WebSocket API (server-side filtered triggers, including attribute changes), so track changes appear instantly; REST polling remains as a fallback safety net
-- **Cover art** of any size — JPEG is decoded straight from the HTTP stream (~4 kB workspace, no filesystem, no size limit)
+- **Bounded streamed cover art** — JPEG is decoded with a ~4 kB workspace,
+  then safely fitted or center-cropped into the cover viewport
 - **Touch controls**: previous / play-pause / next / volume modal (tap-and-hold repeats), tap the progress bar to seek
 - **Progress bar** extrapolated from `media_position` + `media_position_updated_at` (NTP-synced), so it stays accurate between updates
 - **Diacritics-safe text** — UTF-8 titles are transliterated to ASCII (č→c, ř→r, …) for the bitmap fonts
@@ -144,8 +145,15 @@ mode: single
 - On boot the device connects to Wi-Fi, syncs NTP (UTC, needed for progress extrapolation) and fetches the initial state over REST (`/api/states/<entity>`).
 - It then opens a WebSocket to `/api/websocket`, authenticates with the token and sends `subscribe_trigger` with state triggers for the entity **and** its `media_title`, `media_position` and `volume_level` attributes (a plain state trigger ignores attribute-only changes — that's why the extra triggers are needed).
 - While the WebSocket is healthy, REST polling drops to a 60 s safety interval; on disconnect it falls back to 3 s until the socket reconnects.
-- State JSON is parsed with an ArduinoJson filter (Spotify entities carry a huge `source_list` that would otherwise blow the buffer).
+- State JSON is parsed directly from the HTTP stream with an ArduinoJson filter
+  and a 256 KiB input ceiling (Spotify entities can carry a large `source_list`
+  that is skipped without buffering the complete response).
 - Cover art (`entity_picture`) is fetched through an explicit redirect loop and decoded with the low-level tjpgd API directly from the HTTP stream. Every redirect hop gets a fresh HTTP client; the auth token is attached only when that hop has the exact configured HA scheme, host and port. HTTPS-to-HTTP downgrades and redirect loops are rejected.
+- Cover responses must be `image/jpeg`, no more than 2 MiB, at most 2048×2048
+  decoded pixels, with a 3 s idle timeout and a 10 s total decode deadline.
+  Every output block is clipped to the physical display and cover viewport, so
+  oversized portrait or landscape art cannot overwrite text or controls. These
+  limits bound memory use and preserve device responsiveness.
 
 ## Development
 
@@ -203,3 +211,11 @@ Notes for contributors:
   a separate password; only its ArduinoOTA-compatible hash is persisted. OTA
   upload host and plaintext authentication now come from local environment
   variables instead of tracked project values.
+- **Plan 005 — bounded streamed inputs:** HA state parsing now feeds the filtered
+  ArduinoJson document directly from a size-limited HTTP body stream. Cover
+  downloads enforce media type, byte, idle, total-time and decoded-dimension
+  limits; tjpgd output is center-cropped row by row with stride-correct clipping
+  to the cover viewport. Permanent type/size/decode failures are not retried on
+  every poll, while transient transport failures retain the bounded retry path.
+  Physical-board smoke tests are still required for real HA/CDN timing and TFT
+  output on both supported displays.

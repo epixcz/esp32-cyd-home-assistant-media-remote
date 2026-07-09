@@ -393,6 +393,12 @@ const unsigned long pollIntervalMs = 3000;
 // With a live WebSocket subscription the poll is only a safety net.
 const unsigned long wsPollIntervalMs = 60000;
 const unsigned long progressIntervalMs = 500;
+// Network safety contract: bytes, milliseconds and decoded pixels.
+constexpr size_t MAX_HA_STATE_BYTES = 256 * 1024;
+constexpr size_t MAX_COVER_BYTES = 2 * 1024 * 1024;
+constexpr uint32_t MAX_COVER_TOTAL_MS = 10000;
+constexpr uint32_t MAX_INPUT_IDLE_MS = 3000;
+constexpr uint16_t MAX_JPEG_DIMENSION = 2048;
 const unsigned long touchDebounceMs = 180;
 
 WebSocketsClient ws;
@@ -1165,14 +1171,260 @@ void setVolume(int volume)
 
 void applyMediaState(JsonVariantConst root);
 
-bool fetchMediaState()
+class BoundedHttpBodyStream : public Stream {
+public:
+  BoundedHttpBodyStream(
+    WiFiClient *source, HTTPClient *http, bool chunked, int expectedLength,
+    size_t maxBytes, uint32_t totalTimeoutMs, uint32_t idleTimeoutMs, uint32_t startedAt)
+    : source_(source), http_(http), chunked_(chunked), expectedLength_(expectedLength),
+      maxBytes_(maxBytes), totalTimeoutMs_(totalTimeoutMs), idleTimeoutMs_(idleTimeoutMs),
+      startedAt_(startedAt), lastByteAt_(millis())
+  {
+  }
+
+  int available() override
+  {
+    return result_ == media_remote::InputResult::Ok && !finished_ && source_
+      ? source_->available()
+      : 0;
+  }
+
+  int read() override
+  {
+    uint8_t value;
+    return readBytes(&value, 1) == 1 ? value : -1;
+  }
+
+  int peek() override
+  {
+    return -1;
+  }
+
+  void flush() override
+  {
+    if (source_) {
+      source_->flush();
+    }
+  }
+
+  size_t write(uint8_t) override
+  {
+    return 0;
+  }
+
+  size_t readBytes(char *buffer, size_t length) override
+  {
+    return readBytes(reinterpret_cast<uint8_t *>(buffer), length);
+  }
+
+  size_t readBytes(uint8_t *buffer, size_t length) override
+  {
+    if (!buffer || length == 0 || result_ != media_remote::InputResult::Ok || finished_) {
+      return 0;
+    }
+
+    size_t done = 0;
+    while (done < length && result_ == media_remote::InputResult::Ok && !finished_) {
+      if (chunked_ && chunkRemaining_ == 0 && !prepareNextChunk()) {
+        break;
+      }
+      if (!chunked_ && expectedLength_ >= 0 && bytesRead_ >= static_cast<size_t>(expectedLength_)) {
+        finished_ = true;
+        break;
+      }
+      if (!chunked_ && expectedLength_ < 0 && bytesRead_ >= maxBytes_) {
+        if (source_->available() > 0) {
+          result_ = media_remote::InputResult::TooLarge;
+          break;
+        }
+        if (!http_->connected()) {
+          finished_ = true;
+          break;
+        }
+        media_remote::InputResult timing = media_remote::checkInputBudget(
+          millis(), startedAt_, lastByteAt_, bytesRead_, SIZE_MAX, totalTimeoutMs_, idleTimeoutMs_);
+        if (timing == media_remote::InputResult::Timeout) {
+          result_ = timing;
+          break;
+        }
+        delay(1);
+        continue;
+      }
+      if (!chunked_ && expectedLength_ < 0 && source_->available() == 0 && !http_->connected()) {
+        finished_ = true;
+        break;
+      }
+
+      media_remote::InputResult budget = media_remote::checkInputBudget(
+        millis(), startedAt_, lastByteAt_, bytesRead_, maxBytes_, totalTimeoutMs_, idleTimeoutMs_);
+      if (budget != media_remote::InputResult::Ok) {
+        result_ = budget;
+        break;
+      }
+
+      size_t allowed = min(length - done, maxBytes_ - bytesRead_);
+      if (chunked_) {
+        allowed = min(allowed, chunkRemaining_);
+      } else if (expectedLength_ >= 0) {
+        allowed = min(allowed, static_cast<size_t>(expectedLength_) - bytesRead_);
+      }
+      if (allowed == 0) {
+        result_ = media_remote::InputResult::TooLarge;
+        break;
+      }
+
+      int availableBytes = source_->available();
+      if (availableBytes <= 0) {
+        if (!http_->connected()) {
+          result_ = media_remote::InputResult::TransportError;
+          break;
+        }
+        delay(1);
+        continue;
+      }
+
+      size_t requested = min(allowed, static_cast<size_t>(availableBytes));
+      int count = source_->read(buffer + done, requested);
+      if (count <= 0) {
+        delay(1);
+        continue;
+      }
+      done += static_cast<size_t>(count);
+      bytesRead_ += static_cast<size_t>(count);
+      lastByteAt_ = millis();
+      if (chunked_) {
+        chunkRemaining_ -= static_cast<size_t>(count);
+      }
+    }
+    return done;
+  }
+
+  media_remote::InputResult result() const { return result_; }
+  size_t bytesRead() const { return bytesRead_; }
+
+private:
+  bool readRawByte(uint8_t *value)
+  {
+    while (result_ == media_remote::InputResult::Ok) {
+      media_remote::InputResult timing = media_remote::checkInputBudget(
+        millis(), startedAt_, lastByteAt_, bytesRead_, SIZE_MAX, totalTimeoutMs_, idleTimeoutMs_);
+      if (timing == media_remote::InputResult::Timeout) {
+        result_ = timing;
+        return false;
+      }
+      if (source_->available() > 0) {
+        int readValue = source_->read();
+        if (readValue >= 0) {
+          *value = static_cast<uint8_t>(readValue);
+          lastByteAt_ = millis();
+          return true;
+        }
+      } else if (!http_->connected()) {
+        result_ = media_remote::InputResult::TransportError;
+        return false;
+      }
+      delay(1);
+    }
+    return false;
+  }
+
+  bool prepareNextChunk()
+  {
+    if (finished_) {
+      return false;
+    }
+    if (haveChunkData_) {
+      uint8_t carriageReturn;
+      uint8_t lineFeed;
+      if (!readRawByte(&carriageReturn) || !readRawByte(&lineFeed)
+          || carriageReturn != '\r' || lineFeed != '\n') {
+        result_ = media_remote::InputResult::TransportError;
+        return false;
+      }
+      haveChunkData_ = false;
+    }
+
+    size_t chunkSize = 0;
+    bool haveDigit = false;
+    bool extension = false;
+    size_t headerLength = 0;
+    while (headerLength++ < 32) {
+      uint8_t value;
+      if (!readRawByte(&value)) {
+        return false;
+      }
+      if (value == '\r') {
+        if (!readRawByte(&value) || value != '\n' || !haveDigit) {
+          result_ = media_remote::InputResult::TransportError;
+          return false;
+        }
+        if (chunkSize == 0) {
+          finished_ = true;
+          return false;
+        }
+        if (chunkSize > maxBytes_ - bytesRead_) {
+          result_ = media_remote::InputResult::TooLarge;
+          return false;
+        }
+        chunkRemaining_ = chunkSize;
+        haveChunkData_ = true;
+        return true;
+      }
+      if (extension) {
+        continue;
+      }
+      if (value == ';') {
+        extension = true;
+        continue;
+      }
+      int digit = value >= '0' && value <= '9' ? value - '0'
+        : value >= 'a' && value <= 'f' ? value - 'a' + 10
+        : value >= 'A' && value <= 'F' ? value - 'A' + 10
+        : -1;
+      if (digit < 0 || chunkSize > (SIZE_MAX - static_cast<size_t>(digit)) / 16) {
+        result_ = media_remote::InputResult::TransportError;
+        return false;
+      }
+      haveDigit = true;
+      chunkSize = chunkSize * 16 + static_cast<size_t>(digit);
+    }
+    result_ = media_remote::InputResult::TransportError;
+    return false;
+  }
+
+  WiFiClient *source_;
+  HTTPClient *http_;
+  bool chunked_;
+  int expectedLength_;
+  size_t maxBytes_;
+  uint32_t totalTimeoutMs_;
+  uint32_t idleTimeoutMs_;
+  uint32_t startedAt_;
+  uint32_t lastByteAt_;
+  size_t bytesRead_ = 0;
+  size_t chunkRemaining_ = 0;
+  bool haveChunkData_ = false;
+  bool finished_ = false;
+  media_remote::InputResult result_ = media_remote::InputResult::Ok;
+};
+
+bool responseIsChunked(HTTPClient &http)
+{
+  String transferEncoding = http.header("Transfer-Encoding");
+  transferEncoding.toLowerCase();
+  return transferEncoding.indexOf("chunked") >= 0;
+}
+
+media_remote::InputResult fetchMediaState()
 {
   HTTPClient http;
   String url = makeHaUrl(String("/api/states/") + config.entityId);
   if (!beginHttp(http, url)) {
-    return false;
+    return media_remote::InputResult::TransportError;
   }
   addHaHeaders(http);
+  const char *headerKeys[] = {"Transfer-Encoding"};
+  http.collectHeaders(headerKeys, 1);
 
   int status = http.GET();
   Serial.printf("GET state %s -> %d\n", url.c_str(), status);
@@ -1180,11 +1432,16 @@ bool fetchMediaState()
     Serial.printf("State fetch failed: %d\n", status);
     drawStatusLine("HA state HTTP " + String(status), TFT_RED);
     http.end();
-    return false;
+    return media_remote::InputResult::TransportError;
   }
 
-  String payload = http.getString();
-  http.end();
+  int contentLength = http.getSize();
+  if (contentLength > static_cast<int>(MAX_HA_STATE_BYTES)) {
+    Serial.println("HA state rejected: body too large");
+    drawStatusLine("HA state too large", TFT_RED);
+    http.end();
+    return media_remote::InputResult::TooLarge;
+  }
 
   // Spotify entities carry large attributes (source_list with every device),
   // so parse only the keys we actually use.
@@ -1201,15 +1458,44 @@ bool fetchMediaState()
   filterAttrs["volume_level"] = true;
 
   DynamicJsonDocument doc(3072);
-  DeserializationError error = deserializeJson(doc, payload, DeserializationOption::Filter(filter));
+  WiFiClient *stream = http.getStreamPtr();
+  if (!stream) {
+    http.end();
+    return media_remote::InputResult::TransportError;
+  }
+  BoundedHttpBodyStream body(
+    stream, &http, responseIsChunked(http), contentLength,
+    MAX_HA_STATE_BYTES, 0, MAX_INPUT_IDLE_MS, millis());
+  DeserializationError error = deserializeJson(doc, body, DeserializationOption::Filter(filter));
+  media_remote::InputResult streamResult = body.result();
+  http.end();
   if (error) {
-    Serial.println("Failed to parse state JSON");
+    if (streamResult == media_remote::InputResult::TooLarge) {
+      Serial.println("HA state rejected: streamed body too large");
+      drawStatusLine("HA state too large", TFT_RED);
+      return streamResult;
+    }
+    if (streamResult == media_remote::InputResult::Timeout) {
+      Serial.println("HA state stream timeout");
+      drawStatusLine("HA state timeout", TFT_RED);
+      return streamResult;
+    }
+    if (streamResult == media_remote::InputResult::TransportError) {
+      Serial.println("HA state stream ended early");
+      drawStatusLine("HA state transport error", TFT_RED);
+      return streamResult;
+    }
+    if (error == DeserializationError::NoMemory) {
+      Serial.println("HA state JSON document too small");
+    } else {
+      Serial.println("HA state JSON invalid");
+    }
     drawStatusLine("HA JSON parse failed", TFT_RED);
-    return false;
+    return media_remote::InputResult::JsonError;
   }
 
   applyMediaState(doc.as<JsonVariantConst>());
-  return true;
+  return media_remote::InputResult::Ok;
 }
 
 void applyMediaState(JsonVariantConst root)
@@ -1275,9 +1561,9 @@ void applyMediaState(JsonVariantConst root)
 }
 
 struct JpegStreamCtx {
-  WiFiClient *stream;
-  HTTPClient *http;
-  int remaining;
+  BoundedHttpBodyStream *body;
+  uint32_t startedAt;
+  media_remote::InputResult callbackResult;
 };
 
 int coverDrawX = 0;
@@ -1288,44 +1574,72 @@ int coverDrawY = 0;
 size_t jpgStreamIn(JDEC *jd, uint8_t *buf, size_t len)
 {
   JpegStreamCtx *ctx = (JpegStreamCtx *)jd->device;
-  if ((int)len > ctx->remaining) {
-    len = ctx->remaining;
-  }
   size_t done = 0;
   uint8_t skipBuf[64];
-  unsigned long lastByteAt = millis();
-  while (done < len && media_remote::elapsedMs(millis(), lastByteAt) < 3000) {
+  while (done < len) {
     uint8_t *dst = buf ? buf + done : skipBuf;
     size_t want = buf ? len - done : min(sizeof(skipBuf), len - done);
-    int count = ctx->stream->read(dst, want);
-    if (count > 0) {
-      done += count;
-      lastByteAt = millis();
-    } else if (!ctx->http->connected() && !ctx->stream->available()) {
+    size_t count = ctx->body->readBytes(dst, want);
+    if (count == 0) {
       break;
-    } else {
-      delay(1);
     }
+    done += count;
   }
-  ctx->remaining -= done;
   return done;
 }
 
 int jpgStreamOut(JDEC *jd, void *bitmap, JRECT *rect)
 {
-  int w = rect->right - rect->left + 1;
-  int h = rect->bottom - rect->top + 1;
-  tft.pushImage(coverDrawX + rect->left, coverDrawY + rect->top, w, h, (uint16_t *)bitmap);
+  JpegStreamCtx *ctx = static_cast<JpegStreamCtx *>(jd->device);
+  if (media_remote::elapsedMs(millis(), ctx->startedAt) >= MAX_COVER_TOTAL_MS) {
+    ctx->callbackResult = media_remote::InputResult::Timeout;
+    return 0;
+  }
+  media_remote::Rect sourceBlock = {
+    static_cast<int32_t>(rect->left),
+    static_cast<int32_t>(rect->top),
+    static_cast<int32_t>(rect->right - rect->left + 1),
+    static_cast<int32_t>(rect->bottom - rect->top + 1),
+  };
+  media_remote::Rect viewport = {COVER_X, COVER_Y, COVER_SIZE, COVER_SIZE};
+  media_remote::Rect screen = {0, 0, SCREEN_W, SCREEN_H};
+  media_remote::ClippedBlock clipped;
+  if (!media_remote::clipDecodedBlock(
+        sourceBlock, coverDrawX, coverDrawY, viewport, screen, &clipped)) {
+    return 1;
+  }
+
+  uint16_t *pixels = static_cast<uint16_t *>(bitmap);
+  for (int32_t row = 0; row < clipped.destination.height; row++) {
+    uint16_t *source = pixels
+      + (clipped.sourceY + row) * sourceBlock.width
+      + clipped.sourceX;
+    tft.pushImage(
+      clipped.destination.x, clipped.destination.y + row,
+      clipped.destination.width, 1, source);
+  }
   return 1;
 }
 
-bool downloadAndDrawImage(const String &picture)
+bool isJpegContentType(String contentType)
+{
+  int parameter = contentType.indexOf(';');
+  if (parameter >= 0) {
+    contentType = contentType.substring(0, parameter);
+  }
+  contentType.trim();
+  contentType.toLowerCase();
+  return contentType == "image/jpeg";
+}
+
+media_remote::InputResult downloadAndDrawImage(const String &picture)
 {
   if (picture.length() == 0) {
-    return false;
+    return media_remote::InputResult::InvalidType;
   }
 
   constexpr int maxRedirects = 3;
+  uint32_t downloadStartedAt = millis();
   String imageUrl = makeHaUrl(picture);
   String visited[maxRedirects + 1];
   HTTPClient clients[maxRedirects + 1];
@@ -1333,16 +1647,25 @@ bool downloadAndDrawImage(const String &picture)
   int status = 0;
 
   for (int hop = 0; hop <= maxRedirects; hop++) {
+    if (media_remote::elapsedMs(millis(), downloadStartedAt) >= MAX_COVER_TOTAL_MS) {
+      return media_remote::InputResult::Timeout;
+    }
     visited[hop] = imageUrl;
     http = &clients[hop];
     if (!beginHttp(*http, imageUrl)) {
-      return false;
+      return media_remote::InputResult::TransportError;
     }
+    const char *headerKeys[] = {"Content-Type", "Transfer-Encoding"};
+    http->collectHeaders(headerKeys, 2);
     if (isHaHostUrl(imageUrl)) {
       http->addHeader("Authorization", "Bearer " + String(config.token));
     }
 
     status = http->GET();
+    if (media_remote::elapsedMs(millis(), downloadStartedAt) >= MAX_COVER_TOTAL_MS) {
+      http->end();
+      return media_remote::InputResult::Timeout;
+    }
     Serial.printf("GET image hop %d -> %d\n", hop, status);
     if (status == 200) {
       break;
@@ -1356,7 +1679,7 @@ bool downloadAndDrawImage(const String &picture)
     if (!redirect || hop == maxRedirects) {
       Serial.printf("Image fetch failed: %d\n", status);
       http->end();
-      return false;
+      return media_remote::InputResult::TransportError;
     }
 
     String location = http->getLocation();
@@ -1366,13 +1689,13 @@ bool downloadAndDrawImage(const String &picture)
       Serial.println("Image redirect blocked");
       drawStatusLine("Image redirect blocked", TFT_RED);
       http->end();
-      return false;
+      return media_remote::InputResult::TransportError;
     }
     for (int previous = 0; previous <= hop; previous++) {
       if (visited[previous] == resolved) {
         Serial.println("Image redirect loop blocked");
         http->end();
-        return false;
+        return media_remote::InputResult::TransportError;
       }
     }
 
@@ -1380,12 +1703,27 @@ bool downloadAndDrawImage(const String &picture)
     imageUrl = resolved;
   }
 
-  // Decode straight from the HTTP stream with the low-level tjpgd API —
-  // needs only a ~4 kB workspace, so cover size doesn't matter.
-  JpegStreamCtx ctx;
-  ctx.stream = http->getStreamPtr();
-  ctx.http = http;
-  ctx.remaining = http->getSize() > 0 ? http->getSize() : 0x7FFFFFFF;
+  if (!isJpegContentType(http->header("Content-Type"))) {
+    Serial.println("Cover rejected: Content-Type is not image/jpeg");
+    http->end();
+    return media_remote::InputResult::InvalidType;
+  }
+  int contentLength = http->getSize();
+  if (contentLength > static_cast<int>(MAX_COVER_BYTES)) {
+    Serial.println("Cover rejected: body too large");
+    http->end();
+    return media_remote::InputResult::TooLarge;
+  }
+
+  WiFiClient *stream = http->getStreamPtr();
+  if (!stream) {
+    http->end();
+    return media_remote::InputResult::TransportError;
+  }
+  BoundedHttpBodyStream body(
+    stream, http, responseIsChunked(*http), contentLength,
+    MAX_COVER_BYTES, MAX_COVER_TOTAL_MS, MAX_INPUT_IDLE_MS, downloadStartedAt);
+  JpegStreamCtx ctx = {&body, downloadStartedAt, media_remote::InputResult::Ok};
 
   static uint8_t jdWorkspace[3904];
   JDEC jdec;
@@ -1393,7 +1731,15 @@ bool downloadAndDrawImage(const String &picture)
   if (result != JDR_OK) {
     Serial.printf("Cover JPEG prepare failed: %d\n", (int)result);
     http->end();
-    return false;
+    return body.result() == media_remote::InputResult::Ok
+      ? media_remote::InputResult::DecodeError
+      : body.result();
+  }
+  if (jdec.width == 0 || jdec.height == 0
+      || jdec.width > MAX_JPEG_DIMENSION || jdec.height > MAX_JPEG_DIMENSION) {
+    Serial.printf("Cover rejected: dimensions %ux%u\n", jdec.width, jdec.height);
+    http->end();
+    return media_remote::InputResult::TooLarge;
   }
   // Bodmer's tjpgd fork swaps RGB565 bytes inside the decoder; jd_prepare
   // leaves the field uninitialized, so set it explicitly.
@@ -1405,8 +1751,8 @@ bool downloadAndDrawImage(const String &picture)
   }
   int drawW = jdec.width >> scale;
   int drawH = jdec.height >> scale;
-  coverDrawX = COVER_X + max(0, (COVER_SIZE - drawW) / 2);
-  coverDrawY = COVER_Y + max(0, (COVER_SIZE - drawH) / 2);
+  coverDrawX = COVER_X + (COVER_SIZE - drawW) / 2;
+  coverDrawY = COVER_Y + (COVER_SIZE - drawH) / 2;
 
   tft.fillRect(COVER_X, COVER_Y, COVER_SIZE, COVER_SIZE, TFT_BLACK);
   result = jd_decomp(&jdec, jpgStreamOut, scale);
@@ -1414,10 +1760,39 @@ bool downloadAndDrawImage(const String &picture)
 
   Serial.printf("Cover: %ux%u scale=1/%d result=%d\n", jdec.width, jdec.height, 1 << scale, (int)result);
   if (result != JDR_OK) {
-    return false;
+    if (ctx.callbackResult != media_remote::InputResult::Ok) {
+      return ctx.callbackResult;
+    }
+    return body.result() == media_remote::InputResult::Ok
+      ? media_remote::InputResult::DecodeError
+      : body.result();
+  }
+  if (media_remote::elapsedMs(millis(), downloadStartedAt) >= MAX_COVER_TOTAL_MS) {
+    return media_remote::InputResult::Timeout;
   }
   imageDisplayed = true;
-  return true;
+  return media_remote::InputResult::Ok;
+}
+
+const char *inputResultName(media_remote::InputResult result)
+{
+  switch (result) {
+    case media_remote::InputResult::Ok: return "ok";
+    case media_remote::InputResult::TransportError: return "transport";
+    case media_remote::InputResult::TooLarge: return "too-large";
+    case media_remote::InputResult::Timeout: return "timeout";
+    case media_remote::InputResult::InvalidType: return "invalid-type";
+    case media_remote::InputResult::DecodeError: return "decode";
+    case media_remote::InputResult::JsonError: return "json";
+  }
+  return "unknown";
+}
+
+bool isPermanentCoverFailure(media_remote::InputResult result)
+{
+  return result == media_remote::InputResult::TooLarge
+    || result == media_remote::InputResult::InvalidType
+    || result == media_remote::InputResult::DecodeError;
 }
 
 void refreshDisplayAfterState()
@@ -1439,22 +1814,34 @@ void refreshDisplayAfterState()
   if (currentMedia.picture != lastPicture) {
     static String failedPicture;
     static int failCount = 0;
+    static bool permanentFailure = false;
     if (currentMedia.picture != failedPicture) {
       failCount = 0;
+      permanentFailure = false;
     }
-    if (failCount >= 3) {
-      return; // give up on this picture, keep whatever is on screen
+    if (permanentFailure || failCount >= 3) {
+      lastPicture = currentMedia.picture;
+      return;
     }
     lastPicture = currentMedia.picture;
-    if (!downloadAndDrawImage(currentMedia.picture)) {
+    media_remote::InputResult imageResult = downloadAndDrawImage(currentMedia.picture);
+    if (imageResult != media_remote::InputResult::Ok) {
+      Serial.printf("Cover failed: %s\n", inputResultName(imageResult));
+      drawStatusLine("Cover " + String(inputResultName(imageResult)), TFT_RED);
       tft.fillRect(COVER_X, COVER_Y, COVER_SIZE, COVER_SIZE, TFT_BLACK);
       tft.drawRect(COVER_X - 1, COVER_Y - 1, COVER_SIZE + 2, COVER_SIZE + 2, TFT_DARKGREY);
       imageDisplayed = false;
       failedPicture = currentMedia.picture;
-      failCount++;
-      lastPicture = ""; // retry on the next poll (up to 3 attempts)
+      permanentFailure = isPermanentCoverFailure(imageResult);
+      if (!permanentFailure) {
+        failCount++;
+        if (failCount < 3) {
+          lastPicture = "";
+        }
+      }
     } else {
       failCount = 0;
+      permanentFailure = false;
     }
   }
 }
@@ -1755,7 +2142,7 @@ void setup()
   drawStatusLine("WiFi " + WiFi.localIP().toString(), TFT_GREEN);
   delay(500);
   drawStatusLine("Fetching HA state...");
-  if (fetchMediaState()) {
+  if (fetchMediaState() == media_remote::InputResult::Ok) {
     refreshDisplayAfterState();
   } else {
     drawCenteredMessage("HA unavailable", "Check URL/token/entity");
@@ -1801,7 +2188,7 @@ void loop()
 
   if (media_remote::deadlineReached(millis(), nextPollAt)) {
     nextPollAt = millis() + (wsActive() ? wsPollIntervalMs : pollIntervalMs);
-    if (fetchMediaState() && !showVolumeModal) {
+    if (fetchMediaState() == media_remote::InputResult::Ok && !showVolumeModal) {
       refreshDisplayAfterState();
     }
   }
