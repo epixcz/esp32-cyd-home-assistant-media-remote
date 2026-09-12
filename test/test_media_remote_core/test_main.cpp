@@ -193,6 +193,13 @@ void testClipDecodedBlocks()
   TEST_ASSERT_FALSE(clipDecodedBlock({0, 0, 10, 10}, 0, 0, cover88, screen, nullptr));
 }
 
+void runTransportTests();
+void runAdapterTests();
+void runWebSocketTests();
+void runResolverTests();
+void runAuthorizationTests();
+void runTrickleTests();
+
 int main(int argc, char **argv)
 {
   UNITY_BEGIN();
@@ -205,5 +212,11 @@ int main(int argc, char **argv)
   RUN_TEST(testCredentialPolicy);
   RUN_TEST(testInputBudgetPolicy);
   RUN_TEST(testClipDecodedBlocks);
+  runTransportTests();
+  runAdapterTests();
+  runWebSocketTests();
+  runResolverTests();
+  runAuthorizationTests();
+  runTrickleTests();
   return UNITY_END();
 }

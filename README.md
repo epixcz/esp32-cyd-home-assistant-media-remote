@@ -150,7 +150,8 @@ mode: single
   that is skipped without buffering the complete response).
 - Cover art (`entity_picture`) is fetched through an explicit redirect loop and decoded with the low-level tjpgd API directly from the HTTP stream. Every redirect hop gets a fresh HTTP client; the auth token is attached only when that hop has the exact configured HA scheme, host and port. HTTPS-to-HTTP downgrades and redirect loops are rejected.
 - Cover responses must be `image/jpeg`, no more than 2 MiB, at most 2048×2048
-  decoded pixels, with a 3 s idle timeout and a 10 s total decode deadline.
+  decoded pixels, with a 3 s idle timeout and a shared 10 s download/decode budget,
+  including DNS, connection, request, response headers and all redirect hops.
   Every output block is clipped to the physical display and cover viewport, so
   oversized portrait or landscape art cannot overwrite text or controls. These
   limits bound memory use and preserve device responsiveness.
@@ -169,16 +170,22 @@ Before committing, run the same complete build matrix as CI:
 
 ```sh
 pio test -c platformio.test.ini -e native
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test -p 'test_*.py'
 pio run -e cyd -e cyd2usb -e diag -e esp32_3248s035c -e diag_esp32_3248s035c -e touchdiag_esp32_3248s035c
 ```
 
-The native suite covers overflow-safe progress, timer rollover, URL-origin and
-credential-update policies without hardware. The six firmware environments
-cover both production board variants and all diagnostic firmwares. Dependency
-updates should be made separately from feature changes, then verified with the
-native suite, full build matrix and a smoke test on both physical boards.
+The native suite exercises the production transport overrides, body framing,
+authorization helper, asynchronous resolver lifecycle and control decisions with
+host fakes, plus the exact pinned WebSockets post-connect verification callback.
+It covers failed/replaced certificates, DNS/TCP/TLS delays, partial writes,
+trickling headers/bodies, rollover, byte ceilings, truncated/chunked responses,
+late DNS callbacks and rejected controls. It uses one Unity entrypoint because
+PlatformIO 6.1.19 can misidentify subsequent native suites as board uploads.
+The six firmware environments compile both production boards and diagnostics.
+Native fakes do not prove ESP32 timing, TLS interoperability or physical UI
+behavior: dependency updates require smoke tests on both physical boards.
 
-Everything lives in `src/main.cpp`; the board-specific layout constants are at the top of the main firmware section, guarded by `PANEL_*` defines. Diagnostic firmwares are selected with the `DIAGNOSTIC_TFT` / `DIAGNOSTIC_GT911` build flags (see `platformio.ini`).
+Firmware UI and orchestration live in `src/main.cpp`; portable policies, controls and transport adapters live under `lib/`. The board-specific layout constants are at the top of the main firmware section, guarded by `PANEL_*` defines. Diagnostic firmwares are selected with the `DIAGNOSTIC_TFT` / `DIAGNOSTIC_GT911` build flags (see `platformio.ini`).
 
 Notes for contributors:
 
@@ -219,3 +226,51 @@ Notes for contributors:
   every poll, while transient transport failures retain the bounded retry path.
   Physical-board smoke tests are still required for real HA/CDN timing and TFT
   output on both supported displays.
+
+
+## Transport and command guarantees
+
+HA HTTPS verifies the configured SHA-256 pin and hostname on **every** TLS
+connection, including HTTPClient reconnects, before any HTTP headers or bearer
+token are written. Host matching is case-insensitive; scheme and port must match
+for authorization. HTTP remains a trusted-LAN option. External HTTPS cover hosts
+remain unauthenticated and use permissive TLS; they never receive the HA token.
+
+REST state reads have a 10 s total budget and service calls 6 s. Covers share 10 s
+across redirects and decoding. DNS is scheduled through lwIP without its fixed
+blocking hostname timeout. A timed-out lookup retains its callback storage until
+completion; another hostname lookup fails promptly while that slot is pending.
+TCP and TLS divide the remaining connection allowance, while socket writes and
+HTTP header/body reads retain the original deadline. Millisecond bounds may be
+exceeded by task scheduling or an in-progress TLS computation; these are bounded
+blocking adapters, not a hard-real-time guarantee. Calls still run in the UI
+loop and can pause touch handling for their budget.
+
+Both plain and TLS WebSocket connection attempts have a separate 6 s budget.
+WSS verifies the pin before exposing the connected socket and again in the
+library callback before its upgrade request. Established WebSocket sessions
+retain the library's normal message timeouts, reconnect and heartbeat behavior;
+the 6 s connection budget does not expire a healthy long-lived session.
+
+Seek, volume and play/pause only update confirmed display state after a 2xx
+service response. Errors preserve the confirmed value, show a short failure,
+and schedule a state refresh. Commands are never automatically retried. Held
+volume adjustments use the confirmed base and stop sending at 0/100. A resumed
+progress clock excludes time spent paused.
+
+### Pinned WebSockets customization
+
+`scripts/patch_websockets.py` runs before compilation after dependency discovery.
+It checks WebSockets 2.7.3 and the full source hash, then applies only the tracked
+substitutions in `patches/websockets-2.7.3-pin.json`: local bounded client
+allocation and the ESP32 fingerprint handshake branch. An already patched source
+is accepted by its exact hash; any other source/version fails the build. The
+native callback fixture is checked against this source on every firmware build.
+The two explicit local include paths in `platformio.ini` are required because
+PlatformIO discovers library dependencies before the post-script runs.
+
+For dependency updates, review the new connect/verify/upgrade sequence and
+Arduino timeout units, deliberately refresh the hash/substitutions and callback
+fixture, then run native tests, Python patch tests and all six firmware builds
+from fresh dependency caches. Never bypass the hash check or manually patch a
+local `.pio` directory as a permanent fix.

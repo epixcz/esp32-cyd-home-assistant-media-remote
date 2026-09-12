@@ -1,0 +1,23 @@
+{
+  "version": "2.7.3",
+  "original_sha256": "00c7740ae0d18f293f65ea03ca6124986f4a5292d1aef41ba020e877f2ef7eb7",
+  "patched_sha256": "f99a849164c8a246087a0dc8282252889d671dafcc5a5a35ed34dcb49496c40a",
+  "replacements": [
+    {
+      "old": "} else if(!SSL_FINGERPRINT_IS_SET) {\r\n                _client.ssl->setInsecure();\r\n#elif defined(SSL_BARESSL)",
+      "new": "} else if(SSL_FINGERPRINT_IS_SET) {\r\n                // HA pin is checked in connectedCb before upgrade/auth bytes.\r\n                _client.ssl->setInsecure();\r\n#elif defined(SSL_BARESSL)"
+    },
+    {
+      "old": "#include \"WebSocketsClient.h\"",
+      "new": "#include \"WebSocketsClient.h\"\r\n#if defined(ESP32)\r\n#include <MediaRemoteArduino.h>\r\n#endif"
+    },
+    {
+      "old": "            _client.ssl = new WEBSOCKETS_NETWORK_SSL_CLASS();",
+      "new": "#if defined(ESP32)\r\n            _client.ssl = new media_remote::WebSocketSecureTransport(_host.c_str(), _fingerprint.c_str());\r\n#else\r\n            _client.ssl = new WEBSOCKETS_NETWORK_SSL_CLASS();\r\n#endif"
+    },
+    {
+      "old": "            _client.tcp = new WEBSOCKETS_NETWORK_CLASS();",
+      "new": "#if defined(ESP32)\r\n            _client.tcp = new media_remote::WebSocketPlainTransport(_host.c_str(), nullptr);\r\n#else\r\n            _client.tcp = new WEBSOCKETS_NETWORK_CLASS();\r\n#endif"
+    }
+  ]
+}
