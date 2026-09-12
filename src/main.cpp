@@ -10,6 +10,10 @@
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <WiFiClientSecure.h>
+#include <HttpBodyStream.h>
+#include <HttpAuthorization.h>
+#include <ConfirmedControls.h>
+#include <MediaRemoteArduino.h>
 #include <WebSocketsClient.h>
 #include <WiFiManager.h>
 #include <Wire.h>
@@ -367,8 +371,8 @@ TFT_eSPI tft = TFT_eSPI();
 #if defined(PANEL_CYD_2432S028R)
 CYD28_TouchR touch(SCREEN_W, SCREEN_H);
 #endif
-WiFiClient plainClient;
-WiFiClientSecure secureClient;
+media_remote::PlainTransport plainClient;
+media_remote::SecureTransport secureClient;
 
 AppConfig config;
 MediaState currentMedia;
@@ -398,6 +402,8 @@ constexpr size_t MAX_HA_STATE_BYTES = 256 * 1024;
 constexpr size_t MAX_COVER_BYTES = 2 * 1024 * 1024;
 constexpr uint32_t MAX_COVER_TOTAL_MS = 10000;
 constexpr uint32_t MAX_INPUT_IDLE_MS = 3000;
+constexpr uint32_t MAX_STATE_TOTAL_MS = 10000;
+constexpr uint32_t MAX_SERVICE_TOTAL_MS = 6000;
 constexpr uint16_t MAX_JPEG_DIMENSION = 2048;
 const unsigned long touchDebounceMs = 180;
 
@@ -578,59 +584,29 @@ bool normalizeAndValidateConfig()
   return true;
 }
 
-bool beginVerifiedHaHttps(HTTPClient &http, const String &url, const media_remote::Origin &origin)
+bool beginHttp(HTTPClient &http, const String &url, uint32_t startedAt, uint32_t totalMs)
 {
-  if (!config.tlsFingerprint[0]) {
-    Serial.println("HA TLS fingerprint missing");
-    drawStatusLine("TLS fingerprint missing", TFT_RED);
-    return false;
-  }
-
-  secureClient.stop();
-  // The TLS handshake itself is permissive, but no HTTP bytes are sent until
-  // the configured SHA-256 pin and hostname have both been verified below.
-  secureClient.setInsecure();
-  if (!http.begin(secureClient, url)) {
-    return false;
-  }
-  if (!secureClient.connect(origin.host, origin.port, 2000)
-      || !secureClient.verify(config.tlsFingerprint, origin.host)) {
-    Serial.println("HA TLS verification failed");
-    drawStatusLine("HA TLS verify failed", TFT_RED);
-    secureClient.stop();
-    http.end();
-    return false;
-  }
-  return true;
-}
-
-bool beginHttp(HTTPClient &http, const String &url)
-{
-  // Keep timeouts short: these requests run in loop() and block the UI.
-  http.setConnectTimeout(2000);
   http.setTimeout(3000);
-
+  http.setReuse(false);
   media_remote::Origin origin = media_remote::parseHttpOrigin(url.c_str());
-  if (!origin.valid) {
-    Serial.println("Invalid HTTP URL");
-    return false;
-  }
-  if (origin.scheme == media_remote::UrlScheme::Https && isHaHostUrl(url)) {
-    return beginVerifiedHaHttps(http, url, origin);
-  }
+  if (!origin.valid) return false;
   if (origin.scheme == media_remote::UrlScheme::Https) {
-    // External cover hosts never receive the HA token. Their general-purpose
-    // PKI trust remains outside the HA credential boundary in this firmware.
-    secureClient.stop();
-    secureClient.setInsecure();
+    // A null pin is allowed only for unauthenticated external covers.
+    secureClient.configure(origin.host, isHaHostUrl(url) ? config.tlsFingerprint : nullptr, startedAt, totalMs);
     return http.begin(secureClient, url);
   }
+  plainClient.configure(origin.host, nullptr, startedAt, totalMs);
   return http.begin(plainClient, url);
 }
 
-void addHaHeaders(HTTPClient &http)
+bool requestTimedOut(uint32_t startedAt, uint32_t totalMs)
 {
-  http.addHeader("Authorization", "Bearer " + String(config.token));
+  return media_remote::elapsedMs(millis(), startedAt) >= totalMs;
+}
+
+void addHaHeaders(HTTPClient &http, const String &url)
+{
+  media_remote::addHaAuthorization(http, haBaseUrl().c_str(), url.c_str(), config.token);
   http.addHeader("Content-Type", "application/json");
 }
 
@@ -1117,16 +1093,19 @@ void schedulePollIn(unsigned long delayMs)
 
 bool callService(const char *service, const String &body)
 {
+  uint32_t startedAt = millis();
   HTTPClient http;
   String url = makeHaUrl(String("/api/services/media_player/") + service);
-  if (!beginHttp(http, url)) {
+  if (!beginHttp(http, url, startedAt, MAX_SERVICE_TOTAL_MS)) {
     return false;
   }
-  addHaHeaders(http);
+  addHaHeaders(http, url);
   int status = http.POST(body);
   Serial.printf("Service %s status: %d\n", service, status);
   http.end();
-  return status >= 200 && status < 300;
+  bool accepted = status >= 200 && status < 300 && !requestTimedOut(startedAt, MAX_SERVICE_TOTAL_MS);
+  if (!accepted) drawStatusLine(requestTimedOut(startedAt, MAX_SERVICE_TOTAL_MS) ? "Command timeout" : "Command failed", TFT_RED);
+  return accepted;
 }
 
 bool callEntityService(const char *service)
@@ -1136,277 +1115,27 @@ bool callEntityService(const char *service)
 
 void seekToPosition(long positionMs)
 {
-  if (currentMedia.durationMs <= 0) {
-    return;
-  }
-  if (positionMs < 0) {
-    positionMs = 0;
-  }
-  if (positionMs > currentMedia.durationMs) {
-    positionMs = currentMedia.durationMs;
-  }
-  callService("media_seek", "{\"entity_id\":\"" + String(config.entityId) +
-    "\",\"seek_position\":" + String(positionMs / 1000.0f, 1) + "}");
-  currentMedia.progressMs = positionMs;
-  if (currentMedia.playing) {
-    playbackStartedAt = millis() - positionMs;
-  }
-  drawProgress(positionMs, currentMedia.durationMs);
+  bool accepted = media_remote::confirmSeek(currentMedia, playbackStartedAt, positionMs, millis(), [](long position) {
+    return callService("media_seek", "{\"entity_id\":\"" + String(config.entityId) +
+      "\",\"seek_position\":" + String(position / 1000.0f, 1) + "}");
+  });
+  if (accepted) drawProgress(currentMedia.progressMs, currentMedia.durationMs);
   schedulePollIn(800);
 }
 
 void setVolume(int volume)
 {
-  if (volume < 0) {
-    volume = 0;
-  }
-  if (volume > 100) {
-    volume = 100;
-  }
-  currentMedia.volume = volume;
-  float level = volume / 100.0f;
-  callService("volume_set", "{\"entity_id\":\"" + String(config.entityId) + "\",\"volume_level\":" + String(level, 2) + "}");
-  drawVolumeModal();
+  bool accepted = media_remote::confirmVolume(currentMedia, volume, [](int requested) {
+    return callService("volume_set", "{\"entity_id\":\"" + String(config.entityId) +
+      "\",\"volume_level\":" + String(requested / 100.0f, 2) + "}");
+  });
+  if (accepted) drawVolumeModal();
+  schedulePollIn(800);
 }
 
 void applyMediaState(JsonVariantConst root);
 
-class BoundedHttpBodyStream : public Stream {
-public:
-  BoundedHttpBodyStream(
-    WiFiClient *source, HTTPClient *http, bool chunked, int expectedLength,
-    size_t maxBytes, uint32_t totalTimeoutMs, uint32_t idleTimeoutMs, uint32_t startedAt)
-    : source_(source), http_(http), chunked_(chunked), expectedLength_(expectedLength),
-      maxBytes_(maxBytes), totalTimeoutMs_(totalTimeoutMs), idleTimeoutMs_(idleTimeoutMs),
-      startedAt_(startedAt), lastByteAt_(millis())
-  {
-  }
-
-  int available() override
-  {
-    return result_ == media_remote::InputResult::Ok && !finished_ && source_
-      ? source_->available()
-      : 0;
-  }
-
-  int read() override
-  {
-    uint8_t value;
-    return readBytes(&value, 1) == 1 ? value : -1;
-  }
-
-  int peek() override
-  {
-    return -1;
-  }
-
-  void flush() override
-  {
-    if (source_) {
-      source_->flush();
-    }
-  }
-
-  size_t write(uint8_t) override
-  {
-    return 0;
-  }
-
-  size_t readBytes(char *buffer, size_t length) override
-  {
-    return readBytes(reinterpret_cast<uint8_t *>(buffer), length);
-  }
-
-  size_t readBytes(uint8_t *buffer, size_t length) override
-  {
-    if (!buffer || length == 0 || result_ != media_remote::InputResult::Ok || finished_) {
-      return 0;
-    }
-
-    size_t done = 0;
-    while (done < length && result_ == media_remote::InputResult::Ok && !finished_) {
-      if (chunked_ && chunkRemaining_ == 0 && !prepareNextChunk()) {
-        break;
-      }
-      if (!chunked_ && expectedLength_ >= 0 && bytesRead_ >= static_cast<size_t>(expectedLength_)) {
-        finished_ = true;
-        break;
-      }
-      if (!chunked_ && expectedLength_ < 0 && bytesRead_ >= maxBytes_) {
-        if (source_->available() > 0) {
-          result_ = media_remote::InputResult::TooLarge;
-          break;
-        }
-        if (!http_->connected()) {
-          finished_ = true;
-          break;
-        }
-        media_remote::InputResult timing = media_remote::checkInputBudget(
-          millis(), startedAt_, lastByteAt_, bytesRead_, SIZE_MAX, totalTimeoutMs_, idleTimeoutMs_);
-        if (timing == media_remote::InputResult::Timeout) {
-          result_ = timing;
-          break;
-        }
-        delay(1);
-        continue;
-      }
-      if (!chunked_ && expectedLength_ < 0 && source_->available() == 0 && !http_->connected()) {
-        finished_ = true;
-        break;
-      }
-
-      media_remote::InputResult budget = media_remote::checkInputBudget(
-        millis(), startedAt_, lastByteAt_, bytesRead_, maxBytes_, totalTimeoutMs_, idleTimeoutMs_);
-      if (budget != media_remote::InputResult::Ok) {
-        result_ = budget;
-        break;
-      }
-
-      size_t allowed = min(length - done, maxBytes_ - bytesRead_);
-      if (chunked_) {
-        allowed = min(allowed, chunkRemaining_);
-      } else if (expectedLength_ >= 0) {
-        allowed = min(allowed, static_cast<size_t>(expectedLength_) - bytesRead_);
-      }
-      if (allowed == 0) {
-        result_ = media_remote::InputResult::TooLarge;
-        break;
-      }
-
-      int availableBytes = source_->available();
-      if (availableBytes <= 0) {
-        if (!http_->connected()) {
-          result_ = media_remote::InputResult::TransportError;
-          break;
-        }
-        delay(1);
-        continue;
-      }
-
-      size_t requested = min(allowed, static_cast<size_t>(availableBytes));
-      int count = source_->read(buffer + done, requested);
-      if (count <= 0) {
-        delay(1);
-        continue;
-      }
-      done += static_cast<size_t>(count);
-      bytesRead_ += static_cast<size_t>(count);
-      lastByteAt_ = millis();
-      if (chunked_) {
-        chunkRemaining_ -= static_cast<size_t>(count);
-      }
-    }
-    return done;
-  }
-
-  media_remote::InputResult result() const { return result_; }
-  size_t bytesRead() const { return bytesRead_; }
-
-private:
-  bool readRawByte(uint8_t *value)
-  {
-    while (result_ == media_remote::InputResult::Ok) {
-      media_remote::InputResult timing = media_remote::checkInputBudget(
-        millis(), startedAt_, lastByteAt_, bytesRead_, SIZE_MAX, totalTimeoutMs_, idleTimeoutMs_);
-      if (timing == media_remote::InputResult::Timeout) {
-        result_ = timing;
-        return false;
-      }
-      if (source_->available() > 0) {
-        int readValue = source_->read();
-        if (readValue >= 0) {
-          *value = static_cast<uint8_t>(readValue);
-          lastByteAt_ = millis();
-          return true;
-        }
-      } else if (!http_->connected()) {
-        result_ = media_remote::InputResult::TransportError;
-        return false;
-      }
-      delay(1);
-    }
-    return false;
-  }
-
-  bool prepareNextChunk()
-  {
-    if (finished_) {
-      return false;
-    }
-    if (haveChunkData_) {
-      uint8_t carriageReturn;
-      uint8_t lineFeed;
-      if (!readRawByte(&carriageReturn) || !readRawByte(&lineFeed)
-          || carriageReturn != '\r' || lineFeed != '\n') {
-        result_ = media_remote::InputResult::TransportError;
-        return false;
-      }
-      haveChunkData_ = false;
-    }
-
-    size_t chunkSize = 0;
-    bool haveDigit = false;
-    bool extension = false;
-    size_t headerLength = 0;
-    while (headerLength++ < 32) {
-      uint8_t value;
-      if (!readRawByte(&value)) {
-        return false;
-      }
-      if (value == '\r') {
-        if (!readRawByte(&value) || value != '\n' || !haveDigit) {
-          result_ = media_remote::InputResult::TransportError;
-          return false;
-        }
-        if (chunkSize == 0) {
-          finished_ = true;
-          return false;
-        }
-        if (chunkSize > maxBytes_ - bytesRead_) {
-          result_ = media_remote::InputResult::TooLarge;
-          return false;
-        }
-        chunkRemaining_ = chunkSize;
-        haveChunkData_ = true;
-        return true;
-      }
-      if (extension) {
-        continue;
-      }
-      if (value == ';') {
-        extension = true;
-        continue;
-      }
-      int digit = value >= '0' && value <= '9' ? value - '0'
-        : value >= 'a' && value <= 'f' ? value - 'a' + 10
-        : value >= 'A' && value <= 'F' ? value - 'A' + 10
-        : -1;
-      if (digit < 0 || chunkSize > (SIZE_MAX - static_cast<size_t>(digit)) / 16) {
-        result_ = media_remote::InputResult::TransportError;
-        return false;
-      }
-      haveDigit = true;
-      chunkSize = chunkSize * 16 + static_cast<size_t>(digit);
-    }
-    result_ = media_remote::InputResult::TransportError;
-    return false;
-  }
-
-  WiFiClient *source_;
-  HTTPClient *http_;
-  bool chunked_;
-  int expectedLength_;
-  size_t maxBytes_;
-  uint32_t totalTimeoutMs_;
-  uint32_t idleTimeoutMs_;
-  uint32_t startedAt_;
-  uint32_t lastByteAt_;
-  size_t bytesRead_ = 0;
-  size_t chunkRemaining_ = 0;
-  bool haveChunkData_ = false;
-  bool finished_ = false;
-  media_remote::InputResult result_ = media_remote::InputResult::Ok;
-};
+using BoundedHttpBodyStream = media_remote::HttpBodyStream<Stream, WiFiClient, HTTPClient, media_remote::ArduinoClock>;
 
 bool responseIsChunked(HTTPClient &http)
 {
@@ -1417,16 +1146,22 @@ bool responseIsChunked(HTTPClient &http)
 
 media_remote::InputResult fetchMediaState()
 {
+  uint32_t startedAt = millis();
   HTTPClient http;
   String url = makeHaUrl(String("/api/states/") + config.entityId);
-  if (!beginHttp(http, url)) {
+  if (!beginHttp(http, url, startedAt, MAX_STATE_TOTAL_MS)) {
     return media_remote::InputResult::TransportError;
   }
-  addHaHeaders(http);
+  addHaHeaders(http, url);
   const char *headerKeys[] = {"Transfer-Encoding"};
   http.collectHeaders(headerKeys, 1);
 
   int status = http.GET();
+  if (requestTimedOut(startedAt, MAX_STATE_TOTAL_MS)) {
+    http.end();
+    drawStatusLine("HA state timeout", TFT_RED);
+    return media_remote::InputResult::Timeout;
+  }
   Serial.printf("GET state %s -> %d\n", url.c_str(), status);
   if (status != 200) {
     Serial.printf("State fetch failed: %d\n", status);
@@ -1465,7 +1200,7 @@ media_remote::InputResult fetchMediaState()
   }
   BoundedHttpBodyStream body(
     stream, &http, responseIsChunked(http), contentLength,
-    MAX_HA_STATE_BYTES, 0, MAX_INPUT_IDLE_MS, millis());
+    MAX_HA_STATE_BYTES, MAX_STATE_TOTAL_MS, MAX_INPUT_IDLE_MS, startedAt);
   DeserializationError error = deserializeJson(doc, body, DeserializationOption::Filter(filter));
   media_remote::InputResult streamResult = body.result();
   http.end();
@@ -1652,14 +1387,12 @@ media_remote::InputResult downloadAndDrawImage(const String &picture)
     }
     visited[hop] = imageUrl;
     http = &clients[hop];
-    if (!beginHttp(*http, imageUrl)) {
+    if (!beginHttp(*http, imageUrl, downloadStartedAt, MAX_COVER_TOTAL_MS)) {
       return media_remote::InputResult::TransportError;
     }
     const char *headerKeys[] = {"Content-Type", "Transfer-Encoding"};
     http->collectHeaders(headerKeys, 2);
-    if (isHaHostUrl(imageUrl)) {
-      http->addHeader("Authorization", "Bearer " + String(config.token));
-    }
+    media_remote::addHaAuthorization(*http, haBaseUrl().c_str(), imageUrl.c_str(), config.token);
 
     status = http->GET();
     if (media_remote::elapsedMs(millis(), downloadStartedAt) >= MAX_COVER_TOTAL_MS) {
@@ -2044,17 +1777,17 @@ void handleTouch()
 
   if (y > CONTROL_TOP_Y) {
     if (x < (SCREEN_W / 4)) {
-      callEntityService("media_previous_track");
+      if (!callEntityService("media_previous_track")) drawStatusLine("Previous failed", TFT_RED);
       schedulePollIn(800);
     } else if (x < (SCREEN_W / 2)) {
-      callEntityService("media_play_pause");
-      currentMedia.playing = !currentMedia.playing;
-      drawPlayIcon(currentMedia.playing);
+      if (media_remote::confirmPlayPause(currentMedia, playbackStartedAt, millis(), []() {
+          return callEntityService("media_play_pause");
+        })) drawPlayIcon(currentMedia.playing);
       // Give HA time to reflect the new state, otherwise the immediate
       // poll returns the old one and the icon flips back.
       schedulePollIn(1200);
     } else if (x < ((SCREEN_W * 3) / 4)) {
-      callEntityService("media_next_track");
+      if (!callEntityService("media_next_track")) drawStatusLine("Next failed", TFT_RED);
       schedulePollIn(800);
     } else if (currentMedia.hasVolume) {
       showVolumeModal = true;
